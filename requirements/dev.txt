@@ -1,0 +1,3 @@
+# Linting and formatting tooling (make lint / format / quality).
+# Pinned: a new ruff release must not turn a green branch red on its own.
+ruff==0.16.7

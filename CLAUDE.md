@@ -23,9 +23,14 @@ make clean          # tools/clean.py: __pycache__, .ipynb_checkpoints, tool cach
 .venv/Scripts/python.exe -m ruff check utils/fancy_hist.py   # a single file
 ```
 
+`make quality` also runs in CI on every push and pull request to `main`
+(`.github/workflows/quality.yml`): `ubuntu-latest`, Python 3.13, ruff from
+`requirements/dev.txt`. It gates the same `utils/` and `notebooks/` as locally,
+not the root-level modules.
+
 **Scaffolding copied from other projects. Do not rely on it:**
 - `make test` / `make validate` fail: there is no `tests/` directory and pytest is not installed.
-- `make install` / `install-dev` point to `requirements.txt` / `requirements/dev.txt`, which don't exist. There is no dependency manifest.
+- `make install` points to `requirements.txt`, which doesn't exist: there is no runtime dependency manifest. `make install-dev` does work, `requirements/dev.txt` pins `ruff==0.16.7` and nothing else.
 - `make scrape` / `scrape-venta` (FincaRaiz scraper), the `data_loader/` exclusion in `ruff.toml` (LUNA25) and the LUNA25 column names in `utils/README.md` examples all come from earlier projects.
 
 **The venv only has pandas 3.0, numpy, ipykernel and ruff.** Every `utils/`
