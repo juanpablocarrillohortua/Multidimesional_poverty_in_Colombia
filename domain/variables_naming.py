@@ -667,3 +667,69 @@ _fam("P3516", "F51", "24. (FIES) En 12 meses, por falta de dinero, alguien del h
     "S6": "El hogar se quedó sin alimentos", "S7": "Tuvo hambre pero no comió",
     "S8": "No comió en un día entero",
 })
+
+
+# =============================================================================
+# 1. Variables IPM
+# =============================================================================
+
+variables_ipm_dane = {
+    # Identificadores
+    "DIRECTORIO": "Identificador de la vivienda",
+    "SECUENCIA_ENCUESTA": "Número de hogar (archivos de hogar) o de persona (archivos de personas)",
+    "SECUENCIA_P": "Número de hogar dentro de la vivienda (archivos de personas)",
+    "ORDEN": "Número de persona dentro del hogar",
+    "FEX_C": "Factor de expansión",
+
+    # Geografía (Datos de la vivienda)
+    "P1_DEPARTAMENTO": "Código del departamento (2 dígitos, leer como str)",
+    "P1_MUNICIPIO": "Código del municipio (3 dígitos, leer como str)",
+    "CLASE": "1 = cabecera, 2 = centros poblados y rural disperso",
+
+    # Personas (Características y composición del hogar)
+    "P6040": "Edad en años cumplidos",
+    "P6020": "Sexo al nacer",
+    "P6051": "Parentesco con el jefe del hogar",
+
+    # Educación
+    "P6160": "¿Sabe leer y escribir?",
+    "P8586": "¿Actualmente estudia?",
+    "P8587": "Nivel educativo más alto alcanzado",
+    "P8587S1": "Grado o año aprobado en ese nivel",
+    "P1088": "Nivel en el que está matriculado",
+    "P1088S1": "Grado o año que cursa",
+    "P6180": "¿Recibe alimentos en el plantel gratis o por pago simbólico?",
+
+    # Primera infancia (Atención integral de menores de 5 años)
+    "P51": "Dónde o con quién permanece la mayor parte del tiempo entre semana",
+    "P55": "¿Recibe desayuno o almuerzo en el lugar donde permanece?",
+    "P774": "¿Paga por esta alimentación?",
+
+    # Salud
+    "P6090": "Afiliación a seguridad social en salud",
+    "P5665": "¿Tuvo un problema de salud en los últimos 30 días sin hospitalización?",
+    "P8563": "¿Qué hizo principalmente para tratar ese problema de salud?",
+
+    # Fuerza de trabajo
+    "P6240": "Actividad en la que ocupó la mayor parte del tiempo la semana pasada",
+    "P6250": "¿Realizó alguna actividad paga por una hora o más?",
+    "P6260": "¿Tenía trabajo o negocio aunque no trabajó?",
+    "P6270": "¿Trabajó en un negocio sin que le pagaran?",
+    "P6280": "¿Hizo diligencias para conseguir trabajo en las últimas 4 semanas?",
+    "P6351": "¿Estaba disponible la semana pasada para empezar a trabajar?",
+    "P7250": "Semanas buscando trabajo (privado si son más de 52)",
+    "P6920": "¿Cotiza actualmente a un fondo de pensiones?",
+    "P8642": "¿Recibió el mes pasado ingreso por pensión? (condición de pensionado)",
+
+    # Vivienda (Datos de la vivienda)
+    "P8520S5": "¿Tiene acueducto?",
+    "P8520S3": "¿Tiene alcantarillado?",
+    "P4015": "Material predominante de los pisos",
+    "P4005": "Material predominante de las paredes exteriores",
+
+    # Servicios del hogar
+    "P8530": "Fuente principal del agua para preparar alimentos",
+    "P8526": "Tipo de servicio sanitario",
+    "P5010": "Número de cuartos en que duermen las personas del hogar",
+    "CANT_PERSONAS_HOGAR": "Número de personas que componen el hogar",
+}
