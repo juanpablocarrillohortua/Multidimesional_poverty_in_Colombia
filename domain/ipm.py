@@ -22,11 +22,32 @@ Uso
     ipm = IPM(caracteristicas=INDICADORES_ELIMINADOS)
     hogares = ipm.fit_transform(df)
     y = hogares["POBRE"]
-    X_car = hogares[CARACTERISTICAS_NUEVAS]
+    X_car = hogares[CARACTERISTICAS_NUEVAS]   # versión binaria (CAR_*)
+    X_org = hogares[ORIGINALES_NUEVAS]        # versión en valores originales (ORG_*)
     IPM.resumen(hogares)
 
 `df` debe tener una fila por persona, con todas las tablas de la ECV
 consolidadas y los nombres de columnas en mayúsculas.
+
+Análisis de robustez del corte (métodos estáticos, ver cada docstring)
+---------------------------------------------------------------------
+    w = ipm.w_
+
+    # Figura 2: robustez al corte k
+    dom = IPM.dominancia_k(hogares, w)                  # M0 de 4 grupos aleatorios
+    IPM.grafico_dominancia(dom)
+
+    # Tabla 3: robustez a los indicadores
+    esq = IPM.esquemas_sin_indicador(w, ipm.indicadores_)
+    tau, p, m0 = IPM.kendall_esquemas(hogares, esq)
+    IPM.grafico_kendall(tau, p)
+
+    # Tabla 6: robustez a los pesos
+    esq = IPM.esquemas_peso_dimension(w, ipm.indicadores_)
+    tau, p, m0 = IPM.kendall_esquemas(hogares, esq)
+    IPM.grafico_kendall(tau, p)
+
+Referencia: Zhao, Cheah y Moses (2024), PLOS ONE 19(5): e0300263.
 
 Nota sobre sklearn: IPM convierte filas de personas en filas de hogares,
 así que no puede ir antes de un modelo dentro de un mismo Pipeline. Córrelo
@@ -38,6 +59,7 @@ import operator
 
 import numpy as np
 import pandas as pd
+from scipy.stats import kendalltau
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 
@@ -49,6 +71,8 @@ __all__ = [
     "DANE_K",
     "INDICADORES_ELIMINADOS",
     "IPM",
+    "ORIGINALES_EXCLUIDAS",
+    "ORIGINALES_NUEVAS",
     "VARIABLES_COMPARTIDAS",
     "VARIABLES_CORTE",
     "VARIABLES_IPM",
@@ -283,6 +307,25 @@ CARACTERISTICAS_NUEVAS = [
     if f"CAR_{n}" not in CARACTERISTICAS_EXCLUIDAS
 ]
 
+# Versión de las características en valores originales (columnas ORG_*).
+# - Indicadores de vivienda (sin filtro de personas): el código crudo de cada
+#   variable de la ECV, una columna por variable (ORG_P8530, ORG_P8526...).
+#   Son categóricas: conviene codificarlas con one-hot.
+# - Indicadores de personas (con filtro): proporción de miembros elegibles que
+#   cumplen la condición de privación (0 a 1). NaN si el hogar no tiene
+#   miembros elegibles. Ej.: ORG_analfabetismo = proporción de personas de 15
+#   años o más que no saben leer ni escribir.
+ORIGINALES_EXCLUIDAS = ["ORG_trabajo_informal"]  # mismo motivo que CAR_
+ORIGINALES_NUEVAS = [
+    "ORG_analfabetismo",
+    "ORG_trabajo_infantil",
+    "ORG_sin_aseguramiento",
+    "ORG_P8520S5",  # agua, cabecera: ¿tiene acueducto?
+    "ORG_P8530",  # agua, rural: fuente del agua para preparar alimentos
+    "ORG_P8520S3",  # excretas, cabecera: ¿tiene alcantarillado?
+    "ORG_P8526",  # excretas, rural: tipo de servicio sanitario
+]
+
 # Variables crudas que solo usan los indicadores eliminados: se pueden usar
 # como features
 VARIABLES_LIBERADAS = ["P6160", "P8520S5", "P8530", "P8520S3", "P8526"]
@@ -452,7 +495,6 @@ class IPM(BaseEstimator, TransformerMixin):
         Por defecto DANE_INDICADORES.
     caracteristicas : list, opcional
         Indicadores que se calculan pero no entran al corte (salen como CAR_*).
-        Para usar el metodo mas cercano al del DANE dejelo vacio.
     w : dict, opcional
         Pesos de los indicadores del corte. Debe cubrir todos los indicadores
         del corte y sumar 1. Por defecto, equiponderación por dimensión.
@@ -538,6 +580,7 @@ class IPM(BaseEstimator, TransformerMixin):
         hog["C"] = self._puntaje(hog)
         hog["POBRE"] = self._identificar(hog["C"])
         hog = hog.rename(columns={n: f"CAR_{n}" for n in self.caracteristicas_})
+        hog = hog.join(self._originales(x))
         return hog.reset_index()[list(self.get_feature_names_out())]
 
     def get_feature_names_out(self, input_features=None):
@@ -548,10 +591,24 @@ class IPM(BaseEstimator, TransformerMixin):
                 "PESO",
                 *self.w_,
                 *[f"CAR_{n}" for n in self.caracteristicas_],
+                *self._columnas_org(),
                 "C",
                 "POBRE",
             ]
         )
+
+    def _columnas_org(self):
+        """Nombres de las columnas ORG_* según las características elegidas."""
+        cols = []
+        for n in self.caracteristicas_:
+            s = self.indicadores_[n]
+            if s.get("filtro"):
+                cols.append(f"ORG_{n}")
+            else:
+                var = s["var"]
+                columnas = var.values() if isinstance(var, dict) else [var]
+                cols += [f"ORG_{v}" for v in columnas]
+        return list(dict.fromkeys(cols))  # sin duplicados, en orden
 
     # ---------------- validación de entrada ----------------
     def _columnas_requeridas(self):
@@ -612,10 +669,10 @@ class IPM(BaseEstimator, TransformerMixin):
         # ------------------------------------------------------------------
         tope = cod["tope_anos_superior"]
         estudia = num("P8586").eq(1)
-        na, ga = num("P8587"), num("P8587S1") # nivel alcanzado, grado alcanzado (ultimo aprovado)
-        sa = num("P6211").clip(upper=tope) # Años de superior alcanzado (no semestres)
-        nm, gm = num("P1088"), num("P1088S1") # nivel matriculado, grado matriculado
-        sm = num("P6216").clip(upper=tope) # Años de superior aprovados
+        na, ga = num("P8587"), num("P8587S1")
+        sa = num("P6211").clip(upper=tope)
+        nm, gm = num("P1088"), num("P1088S1")
+        sm = num("P6216").clip(upper=tope)
         x["ANOS_EDUC"] = np.select(
             [
                 estudia & nm.eq(1),  # matriculado en preescolar
@@ -754,11 +811,7 @@ class IPM(BaseEstimator, TransformerMixin):
 
     # ---------------- fase 1: primer corte (z) ----------------
     def _privaciones(self, x):
-        """
-        Calcula todos los indicadores (corte y características) a nivel hogar.
-
-        Cada indicador es binario, esta privado si o no.
-        """
+        """Calcula todos los indicadores (corte y características) a nivel hogar."""
         claves = list(self.claves_hogar)
         clase = pd.to_numeric(x[self.col_clase], errors="coerce")
         hog = x.groupby(claves)[self.col_peso].sum().rename("PESO").to_frame()
@@ -771,9 +824,7 @@ class IPM(BaseEstimator, TransformerMixin):
         )
 
         for nombre, s in self.indicadores_.items():
-            m = pd.Series(True, index=x.index)
-            for col, op, z in s.get("filtro", []):
-                m &= _comparar(x[col], op, z)
+            m = self._elegibles(x, s)
             xf, cf = x[m], clase[m]
             valor = _valor(xf, s["var"], cf)
 
@@ -803,9 +854,59 @@ class IPM(BaseEstimator, TransformerMixin):
             hog[nombre] = g if g.isna().any() else g.astype(int)
         return hog
 
+    def _elegibles(self, x, s):
+        """Máscara True para las personas que cumplen el filtro del indicador."""
+        m = pd.Series(True, index=x.index)
+        for col, op, z in s.get("filtro", []):
+            m &= _comparar(x[col], op, z)
+        return m
+
+    def _originales(self, x):
+        """Versión de las características en valores originales (columnas ORG_*).
+
+        - Indicador de vivienda (sin filtro): el código crudo de cada variable
+          de la ECV, tomado del primer miembro del hogar (es igual en todos).
+          Si `var` cambia por zona, sale una columna por cada variable.
+        - Indicador de personas con agg="mean": promedio del valor entre los
+          miembros elegibles (por ejemplo, años de educación promedio).
+        - Indicador de personas con agg="any": proporción de miembros
+          elegibles que cumplen la condición de privación (0 a 1).
+        Los hogares sin miembros elegibles quedan en NaN.
+        """
+        claves = list(self.claves_hogar)
+        clase = pd.to_numeric(x[self.col_clase], errors="coerce")
+        idx = x.groupby(claves).size().index
+        org = pd.DataFrame(index=idx)
+
+        for nombre in self.caracteristicas_:
+            s = self.indicadores_[nombre]
+
+            if not s.get("filtro"):
+                var = s["var"]
+                columnas = var.values() if isinstance(var, dict) else [var]
+                for col in columnas:
+                    org[f"ORG_{col}"] = (
+                        pd.to_numeric(x[col], errors="coerce")
+                        .groupby([x[c] for c in claves])
+                        .first()
+                        .reindex(idx)
+                    )
+                continue
+
+            m = self._elegibles(x, s)
+            xf, cf = x[m], clase[m]
+            valor = _valor(xf, s["var"], cf)
+            if s.get("agg", "any") == "mean":
+                v = pd.to_numeric(valor, errors="coerce")
+            else:
+                v = _comparar(valor, s["op"], s["z"], cf).astype(float)
+            org[f"ORG_{nombre}"] = (
+                xf[claves].assign(v=v).groupby(claves)["v"].mean().reindex(idx)
+            )
+        return org
+
     # ---------------- fase 2: ponderación (w) ----------------
     def _puntaje(self, hog):
-        """Retorna el puntaje de privacion multidimensional de los hogares"""
         w = pd.Series(self.w_)
         return hog[w.index] @ w
 
@@ -818,8 +919,447 @@ class IPM(BaseEstimator, TransformerMixin):
     def resumen(hog):
         """H, A y M0 a nivel personas (PESO = suma de FEX_C del hogar)."""
         p, pobre, c = hog["PESO"], hog["POBRE"], hog["C"]
-        incidencia = (p * pobre).sum() / p.sum()
-        intensidad = (p * pobre * c).sum() / (p * pobre).sum()
-        return pd.Series(
-            {"H": incidencia, "A": intensidad, "M0": incidencia * intensidad}
+        pobres = (p * pobre).sum()
+        incidencia = pobres / p.sum()
+        intensidad = (p * pobre * c).sum() / pobres if pobres > 0 else np.nan
+        m0 = incidencia * intensidad if pobres > 0 else 0.0
+        return pd.Series({"H": incidencia, "A": intensidad, "M0": m0})
+
+    # ==================================================================
+    # Análisis de robustez del corte (métodos estáticos)
+    # ==================================================================
+    # Replican tres análisis de Zhao, Cheah y Moses (2024), "Measurement
+    # and determinants of multidimensional urban poverty", PLOS ONE 19(5):
+    # e0300263, basados en Alkire y Santos (2014):
+    #   - Figura 2: robustez al corte k     → dominancia_k + grafico_dominancia
+    #   - Tabla 3:  robustez a los indicadores → esquemas_sin_indicador
+    #                                           + kendall_esquemas + grafico_kendall
+    #   - Tabla 6:  robustez a los pesos     → esquemas_peso_dimension
+    #                                           + kendall_esquemas + grafico_kendall
+    #
+    # Todos reciben la tabla de hogares que devuelve `transform` (necesita
+    # PESO y las columnas de privación de los indicadores del corte) y los
+    # pesos `w` (por ejemplo, `ipm.w_`). No vuelven a correr `transform`:
+    # recalculan C y POBRE con los pesos y el k que se les pase.
+    # ==================================================================
+
+    @staticmethod
+    def _medidas(hog, w, k):
+        """H, A y M0 recalculados con otros pesos `w` y otro corte `k`."""
+        w = pd.Series(w, dtype=float)
+        c = hog[w.index] @ w
+        pobre = (c >= k - 1e-9).astype(int)
+        return IPM.resumen(pd.DataFrame({"PESO": hog["PESO"], "POBRE": pobre, "C": c}))
+
+    @staticmethod
+    def _grupos(hog, grupo=None, n_grupos=4, semilla=0):
+        """Etiqueta de grupo por hogar.
+
+        - `grupo=None`: divide los hogares al azar en `n_grupos` grupos de
+          igual tamaño ("Grupo 1", "Grupo 2", ...), como hace el artículo.
+        - `grupo="COLUMNA"`: usa esa columna de `hog` (por ejemplo,
+          P1_DEPARTAMENTO, si la pegaste a la tabla de hogares).
+        - `grupo=serie o arreglo`: usa esos valores, en el orden de `hog`.
+        """
+        if grupo is None:
+            rng = np.random.default_rng(semilla)
+            orden = rng.permutation(len(hog))
+            etiquetas = np.empty(len(hog), dtype=object)
+            for i, parte in enumerate(np.array_split(orden, n_grupos), start=1):
+                etiquetas[parte] = f"Grupo {i}"
+            return pd.Series(etiquetas, index=hog.index, name="grupo")
+        if isinstance(grupo, str):
+            return hog[grupo].rename("grupo")
+        return pd.Series(np.asarray(grupo), index=hog.index, name="grupo")
+
+    # ---------------- figura 2: robustez al corte k ----------------
+    @staticmethod
+    def dominancia_k(
+        hog, w, ks=(0.2, 0.25, 0.3, 0.4, 0.5), grupo=None, n_grupos=4, semilla=0
+    ):
+        """M0 de cada grupo para varios valores de k (datos de la figura 2).
+
+        Parámetros
+        ----------
+        hog : DataFrame
+            Salida de `transform`.
+        w : dict
+            Pesos de los indicadores del corte (por ejemplo, `ipm.w_`).
+        ks : valores de k. Por defecto los de la figura 2.
+        grupo : None, str o serie. Con None, divide los hogares al azar en
+            `n_grupos` grupos de igual tamaño, como el artículo. Ver `_grupos`.
+        n_grupos, semilla : solo se usan con `grupo=None`.
+
+        Devuelve
+        --------
+        DataFrame con una fila por grupo y una columna por k (valores de M0).
+        Se grafica con `grafico_dominancia`.
+
+        Cómo interpretar
+        ----------------
+        Es un análisis de dominancia. El grupo A es "más pobre" que el grupo B
+        sin importar k si su M0 es mayor o igual en todos los k probados, y
+        estrictamente mayor en al menos uno. En el gráfico, eso se ve como
+        dos líneas que no se cruzan.
+        - Líneas que no se cruzan: el orden entre esos grupos no depende del
+          corte; la conclusión "A es más pobre que B" se sostiene con
+          cualquier k del rango.
+        - Líneas que se cruzan: el orden depende de k. Si el cruce ocurre
+          lejos del k que usas, preocupa poco; si ocurre cerca, la
+          comparación entre esos dos grupos no es concluyente.
+        - El corte es robusto si la mayoría de los pares de grupos mantienen
+          su orden en todo el rango, sobre todo cerca del k elegido. En el
+          artículo, el orden de sus cuatro grupos se mantiene en casi todos
+          los k, en especial entre 0,25 y 0,3.
+        - Todas las líneas bajan al subir k: con un corte más exigente hay
+          menos pobres. Eso es esperado y no dice nada sobre la robustez;
+          lo que importa es si las líneas se cruzan.
+        Nota: con grupos aleatorios, todos vienen de la misma población, así
+        que sus diferencias son solo ruido de muestreo y es normal que las
+        líneas estén juntas y se crucen. En Colombia es más informativo usar
+        grupos reales (departamentos o regiones), porque la ECV sí trae esa
+        información y los datos del artículo no.
+        """
+        g = IPM._grupos(hog, grupo, n_grupos, semilla)
+        tabla = pd.DataFrame(
+            {
+                nombre: {k: IPM._medidas(sub, w, k)["M0"] for k in ks}
+                for nombre, sub in hog.groupby(g)
+            }
+        ).T
+        tabla.index.name = "grupo"
+        tabla.columns.name = "k"
+        return tabla
+
+    # ---------------- tablas 3 y 6: robustez a indicadores y pesos ----------------
+    @staticmethod
+    def esquemas_sin_indicador(w, indicadores=None, quitar=None):
+        """Escenarios de pesos quitando un indicador a la vez (tabla 3).
+
+        Parámetros
+        ----------
+        w : dict
+            Pesos base (por ejemplo, `ipm.w_`).
+        indicadores : dict, opcional
+            Especificación de indicadores, para saber a qué dimensión
+            pertenece cada uno. Por defecto DANE_INDICADORES.
+        quitar : lista, opcional
+            Indicadores a quitar, uno por escenario. Por defecto, todos los
+            de `w`. El artículo quita tres (asistencia escolar, ingreso y
+            bienes durables); puedes elegir los que quieras probar.
+
+        Devuelve
+        --------
+        dict {nombre del escenario: pesos}. Incluye "Base" (los pesos `w`) y
+        un escenario "Sin <indicador>" por cada indicador quitado, con los
+        pesos recalculados por equiponderación sobre los que quedan. Si el
+        indicador era el único de su dimensión, la dimensión desaparece y
+        las demás se reparten su peso. Se pasa a `kendall_esquemas`.
+
+        Cómo interpretar
+        ----------------
+        Ver `kendall_esquemas`. Si quitar un indicador casi no cambia el
+        orden de los grupos, la medida no depende de ese indicador para
+        decidir qué grupos son más pobres.
+        """
+        indicadores = indicadores or DANE_INDICADORES
+        quitar = list(w) if quitar is None else quitar
+        esquemas = {"Base": dict(w)}
+        for q in quitar:
+            quedan = {n: indicadores[n] for n in w if n != q}
+            esquemas[f"Sin {q}"] = pesos_equiponderados(quedan)
+        return esquemas
+
+    @staticmethod
+    def esquemas_peso_dimension(w, indicadores=None, peso=0.5):
+        """Escenarios de pesos dándole más peso a una dimensión (tabla 6).
+
+        Parámetros
+        ----------
+        w : dict
+            Pesos base (por ejemplo, `ipm.w_`). Solo se usan sus nombres.
+        indicadores : dict, opcional
+            Para saber la dimensión de cada indicador. Por defecto
+            DANE_INDICADORES.
+        peso : float
+            Peso que recibe la dimensión destacada. El resto se reparte por
+            igual entre las demás dimensiones, y dentro de cada dimensión
+            por igual entre sus indicadores. Con 5 dimensiones y peso=0,5,
+            cada una de las otras recibe 0,125 (el artículo tenía 4
+            dimensiones, así que las otras recibían 0,1667).
+
+        Devuelve
+        --------
+        dict {nombre del escenario: pesos}, con "Base" y un escenario
+        "<peso>% <dimensión>" por cada dimensión. Se pasa a
+        `kendall_esquemas`.
+
+        Cómo interpretar
+        ----------------
+        Ver `kendall_esquemas`. Si el orden de los grupos se mantiene aunque
+        una dimensión pese mucho más que las demás, la equiponderación no
+        está determinando qué grupos son más pobres.
+        """
+        indicadores = indicadores or DANE_INDICADORES
+        dims = pd.Series({n: indicadores[n]["dim"] for n in w})
+        n_dims = dims.nunique()
+        esquemas = {"Base": dict(w)}
+        for d in dims.unique():
+            peso_dim = {
+                x: peso if x == d else (1 - peso) / (n_dims - 1) for x in dims.unique()
+            }
+            esquemas[f"{peso:.0%} {d}"] = {
+                n: peso_dim[dims[n]] / (dims == dims[n]).sum() for n in dims.index
+            }
+        return esquemas
+
+    @staticmethod
+    def kendall_esquemas(hog, esquemas, k=DANE_K, grupo=None, n_grupos=4, semilla=0):
+        """Tau de Kendall entre esquemas de indicadores o pesos (tablas 3 y 6).
+
+        Calcula el M0 de cada grupo en cada esquema y compara, para cada par
+        de esquemas, el orden de los grupos de más a menos pobre.
+
+        Parámetros
+        ----------
+        hog : DataFrame
+            Salida de `transform`.
+        esquemas : dict
+            {nombre: pesos}, de `esquemas_sin_indicador`,
+            `esquemas_peso_dimension` o armado a mano.
+        k : float
+            Corte de pobreza. Por defecto 5/15.
+        grupo, n_grupos, semilla : ver `dominancia_k`.
+
+        Devuelve
+        --------
+        (tau, p_valor, m0): tres DataFrames.
+        - tau: tau de Kendall entre cada par de esquemas. Solo se llena el
+          triángulo inferior, como en el artículo. Se grafica con
+          `grafico_kendall`.
+        - p_valor: el p-valor de cada tau (prueba de que tau = 0).
+        - m0: M0 de cada grupo (filas) en cada esquema (columnas), por si
+          quieres ver de dónde salen los ordenamientos.
+
+        Cómo interpretar
+        ----------------
+        Tau mide cuánto coinciden dos ordenamientos de los grupos: 1 es el
+        mismo orden, 0 es ninguna relación y -1 es el orden invertido.
+        - Fíjate sobre todo en la primera columna: compara cada escenario
+          con la medida base. El artículo toma tau > 0,6 como señal de que
+          la medida es robusta: cambiar ese indicador o esos pesos no
+          cambia sustancialmente qué grupos son más pobres.
+        - Un tau bajo entre "Base" y un escenario dice que esa decisión
+          (incluir ese indicador o darle ese peso a la dimensión) reordena
+          los grupos: la medida es sensible a ella y conviene justificarla.
+        - Las demás celdas comparan escenarios entre sí. Sirven para ver si
+          dos cambios mueven los resultados en la misma dirección.
+        - Con pocos grupos, tau solo toma unos pocos valores y la prueba casi
+          nunca es significativa. Con 4 grupos, tau solo puede valer 1,
+          0,67, 0,33, 0, ... y ni siquiera tau = 1 alcanza p < 0,05
+          (p = 0,083). El artículo marca significancia con 4 grupos; tómalo
+          con cautela. Para un análisis más informativo, usa grupos reales y
+          numerosos, como los 33 departamentos (`grupo="P1_DEPARTAMENTO"`).
+        """
+        g = IPM._grupos(hog, grupo, n_grupos, semilla)
+        m0 = pd.DataFrame(
+            {
+                nombre: {
+                    gr: IPM._medidas(sub, w, k)["M0"] for gr, sub in hog.groupby(g)
+                }
+                for nombre, w in esquemas.items()
+            }
         )
+        m0.index.name = "grupo"
+        nombres = list(esquemas)
+        tau = pd.DataFrame(np.nan, index=nombres, columns=nombres)
+        p_valor = tau.copy()
+        for i, a in enumerate(nombres):
+            for b in nombres[: i + 1]:
+                t, p = kendalltau(m0[a], m0[b])
+                tau.loc[a, b], p_valor.loc[a, b] = t, p
+        return tau, p_valor, m0
+
+    # ---------------- gráficos ----------------
+    # Paleta categórica en orden fijo (nunca cíclica), tinta neutra para
+    # textos y ejes, y formas de marcador distintas por serie para que la
+    # identidad no dependa solo del color.
+    _COLORES = [
+        "#2a78d6",
+        "#eb6834",
+        "#1baf7a",
+        "#eda100",
+        "#e87ba4",
+        "#008300",
+        "#6250d6",
+        "#e34948",
+    ]
+    _MARCADORES = ["D", "s", "^", "X", "o", "v", "P", "*"]
+    _TINTA = {
+        "fondo": "#fcfcfb",
+        "texto": "#0b0b0b",
+        "secundario": "#52514e",
+        "eje": "#c3c2b7",
+        "rejilla": "#e1e0d9",
+    }
+
+    @staticmethod
+    def grafico_dominancia(tabla, titulo=None, k_ref=DANE_K):
+        """Gráfico de la figura 2: una línea de M0 por grupo frente a k.
+
+        Parámetros
+        ----------
+        tabla : DataFrame
+            Salida de `dominancia_k`. Máximo 8 grupos, para que cada uno
+            tenga un color distinto; con más (por ejemplo, 33
+            departamentos), grafica un subconjunto de filas.
+        titulo : str, opcional
+        k_ref : float o None
+            Dibuja una línea vertical en el k que usas. Por defecto 5/15.
+
+        Devuelve
+        --------
+        La figura de matplotlib (guárdala con `fig.savefig("fig2.png")`).
+
+        Cómo interpretar
+        ----------------
+        Ver `dominancia_k`: si las líneas no se cruzan, el orden de los
+        grupos no depende de k. Fíjate sobre todo en la zona de la línea
+        vertical, que marca el k que usas.
+        """
+        import matplotlib.pyplot as plt
+
+        if len(tabla) > len(IPM._COLORES):
+            raise ValueError(
+                f"Hay {len(tabla)} grupos y el gráfico admite hasta "
+                f"{len(IPM._COLORES)}. Grafica un subconjunto de filas."
+            )
+        t = IPM._TINTA
+        fig, ax = plt.subplots(figsize=(8, 5))
+        fig.set_facecolor(t["fondo"])
+        ax.set_facecolor(t["fondo"])
+        for i, (nombre, fila) in enumerate(tabla.iterrows()):
+            ax.plot(
+                fila.index.astype(float),
+                fila.values,
+                color=IPM._COLORES[i],
+                marker=IPM._MARCADORES[i],
+                markersize=7,
+                linewidth=2,
+                markeredgecolor=t["fondo"],
+                markeredgewidth=1,
+                label=str(nombre),
+            )
+        if k_ref is not None:
+            ax.axvline(k_ref, color=t["secundario"], linewidth=1, linestyle="--")
+            ax.annotate(
+                f"k = {k_ref:.3g}",
+                xy=(k_ref, 1),
+                xycoords=("data", "axes fraction"),
+                xytext=(4, -2),
+                textcoords="offset points",
+                va="top",
+                color=t["secundario"],
+                fontsize=9,
+            )
+        for lado in ("top", "right", "left"):
+            ax.spines[lado].set_visible(False)
+        ax.spines["bottom"].set_color(t["eje"])
+        ax.grid(axis="y", color=t["rejilla"], linewidth=0.8)
+        ax.set_axisbelow(True)
+        ax.tick_params(colors=t["secundario"], length=0)
+        ax.set_xticks(tabla.columns.astype(float))
+        ax.set_ylim(bottom=0)
+        ax.set_xlabel("k (corte de pobreza)", color=t["secundario"])
+        ax.set_ylabel("M0", color=t["secundario"])
+        ax.legend(frameon=False, labelcolor=t["texto"])
+        if titulo:
+            ax.set_title(titulo, loc="left", color=t["texto"], fontsize=12)
+        fig.tight_layout()
+        return fig
+
+    @staticmethod
+    def grafico_kendall(tau, p_valor=None, titulo=None, alfa=0.01):
+        """Mapa de calor de la matriz de tau de Kendall (tablas 3 y 6).
+
+        Parámetros
+        ----------
+        tau : DataFrame
+            Primer resultado de `kendall_esquemas`.
+        p_valor : DataFrame, opcional
+            Segundo resultado de `kendall_esquemas`. Si se pasa, las celdas
+            con p < `alfa` llevan "**", como en el artículo.
+        titulo : str, opcional
+        alfa : float
+            Nivel de significancia para el "**". Por defecto 0,01, como el
+            artículo.
+
+        Devuelve
+        --------
+        La figura de matplotlib.
+
+        Cómo interpretar
+        ----------------
+        Ver `kendall_esquemas`. Solo se muestra el triángulo inferior, porque
+        la matriz es simétrica. El color va de naranja (-1, orden invertido)
+        a gris (0, sin relación) y a azul (1, mismo orden): una primera
+        columna azul intensa quiere decir que ningún escenario cambia mucho
+        el orden de los grupos respecto a la medida base.
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        from matplotlib.colors import LinearSegmentedColormap
+
+        t = IPM._TINTA
+        # Divergente: dos tonos en los extremos y gris neutro en el centro (0)
+        cmap = LinearSegmentedColormap.from_list(
+            "kendall", ["#eb6834", "#e1e0d9", "#2a78d6"]
+        )
+        texto = tau.map(lambda v: "" if pd.isna(v) else f"{v:.3f}")
+        if p_valor is not None:
+            marca = p_valor.map(lambda p: " **" if pd.notna(p) and p < alfa else "")
+            # Sin "**" en la diagonal: cada esquema comparado consigo mismo
+            diagonal = np.eye(len(tau), dtype=bool)
+            texto = texto + marca.where(tau.notna() & ~diagonal, "")
+        mascara = np.triu(np.ones(tau.shape, dtype=bool), k=1)
+
+        n = len(tau)
+        fig, ax = plt.subplots(figsize=(2.2 + 1.5 * n, 1.2 + 0.75 * n))
+        fig.set_facecolor(t["fondo"])
+        sns.heatmap(
+            tau.astype(float),
+            mask=mascara,
+            annot=texto.values,
+            fmt="",
+            cmap=cmap,
+            vmin=-1,
+            vmax=1,
+            center=0,
+            linewidths=2,
+            linecolor=t["fondo"],
+            cbar_kws={"label": "tau de Kendall", "shrink": 0.8},
+            annot_kws={"color": t["texto"], "fontsize": 10},
+            ax=ax,
+        )
+        ax.set_facecolor(t["fondo"])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.tick_params(colors=t["texto"], length=0)
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+        plt.setp(ax.get_yticklabels(), rotation=0)
+        barra = ax.collections[0].colorbar
+        barra.ax.tick_params(colors=t["secundario"], length=0)
+        barra.outline.set_visible(False)
+        barra.set_label("tau de Kendall", color=t["secundario"])
+        if titulo:
+            ax.set_title(titulo, loc="left", color=t["texto"], fontsize=12)
+        if p_valor is not None:
+            fig.text(
+                0.01,
+                0.01,
+                f"** p < {alfa:g} (bilateral)",
+                color=t["secundario"],
+                fontsize=9,
+            )
+        fig.tight_layout()
+        return fig
