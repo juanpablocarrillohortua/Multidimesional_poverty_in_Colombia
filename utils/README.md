@@ -31,8 +31,10 @@ test_features_against_target(df, ["Age_at_StudyDate", "race"], "label")
 | [`segmented_bars`](segmented_bars.py) | Same bars, one panel per segment | `segmented_bars` | `np.ndarray` of Axes |
 | [`bivaraite_boxplot`](bivaraite_boxplot.py) | Numeric spread across categories | `plot_segmented_boxplot` | nothing |
 | [`category_vs_numeric_plot`](category_vs_numeric_plot.py) | One histogram per category | `plot_faceted_histograms` | nothing |
+| [`join_plots`](join_plots.py) | Joint distribution of two variables, in 3D (plotly) | `discrete_plot_joint`, `continuous_plot_joint` | nothing |
 | [`target_against_features`](target_against_features.py) | Which features relate to the target? (test picked automatically) | `test_features_against_target` | `DataFrame` |
 | [`cat_num_dep`](cat_num_dep.py) | Does a numeric differ across categories? | `hub_pruebas_num_cat` | `DataFrame` |
+| [`cat_cat_dep`](cat_cat_dep.py) | Are two categoricals associated? (chi-square, with assumption check) | `hub_pruebas_cat_cat` | `DataFrame` |
 | [`triple_plot`](triple_plot.py) | Is this variable normal? | `normality_report` | `dict` |
 | [`corr_vector`](corr_vector.py) | Pearson correlation of everything against one target | `plot_target_correlation` | `(fig, ax)` |
 | [`mutual_inf_plot`](mutual_inf_plot.py) | Feature relevance = correlation + mutual information | `analizar_relevancia_caracteristicas` (+4) | `DataFrame` |
@@ -177,6 +179,33 @@ into a subplot grid.
 
 **Returns nothing** — builds a `sns.FacetGrid` and calls `plt.show()`.
 
+## `join_plots`
+
+Interactive plotly figures (needs `plotly`). Both functions call `fig.show()`
+and return nothing, so they can't go into a matplotlib grid.
+
+### `discrete_plot_joint(df, x_col, y_col, ...)` — P(X, Y) as 3D bars
+
+One bar per combination of the two categories, height = joint probability
+(the cells sum to 1).
+
+| Parameter | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `df` | `DataFrame` | — | source data |
+| `x_col`, `y_col` | `str` | — | the two discrete columns |
+| `weights` | `str \| None` | `None` | column of expansion factors. `None` gives **sample** shares (each row counts once); a column such as `"PESO"` gives **population** shares, identical to `pd.crosstab(..., values=df[weights], aggfunc="sum", normalize="all")` |
+| `title` | `str \| None` | `None` | auto-generated; ends in "(ponderada)" when `weights` is set |
+| `colorscale` | `str` | `"Tealgrn"` | plotly colour scale |
+
+With survey data the two can differ a lot: the ECV oversamples poor households
+and households without services, so unweighted shares overstate them.
+
+### `continuous_plot_joint(df, x_col, y_col, ...)` — f(x, y) as a 3D surface
+
+Gaussian KDE of the joint density, with each marginal in its own 2D panel.
+Rows with a null in either column are dropped. Parameters: `title`,
+`colorscale` as above, `grid_size=60` (evaluation points per axis).
+
 ---
 
 # Hypothesis tests
@@ -247,6 +276,48 @@ numeric-vs-categorical decision tree as the table above.
 pair: `var_numerica`, `var_categorica`, `n_grupos`, `prueba`, `estadistico`,
 `p_valor`, `normalidad`, `homocedasticidad`, `decision`, `conclusion`,
 `post_hoc`.
+
+## `cat_cat_dep`
+
+### `hub_pruebas_cat_cat(df, var_base, vars_cat, ...)`
+
+The categorical counterpart of `cat_num_dep`: **one** categorical (typically
+the target) against a list of categoricals. It runs only the chi-square test
+of independence (`scipy.stats.chi2_contingency`, with Yates' correction when
+the table is 2×2). It checks the test's assumptions and reports them, but does
+not switch to another test when they fail.
+
+| Parameter | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `df` | `DataFrame` | — | source data |
+| `var_base` | `str` | — | the fixed categorical (e.g. `"POBRE"`) |
+| `vars_cat` | `list[str] \| str` | — | categoricals to evaluate against it |
+| `alpha` | `float` | `0.05` | significance level |
+
+Assumptions it reports:
+
+| Assumption | Rule | Column |
+| --- | --- | --- |
+| Table at least 2×2 | otherwise the row is `"no aplica"` | `prueba` |
+| Expected frequencies (Cochran) | 2×2: all ≥ 5. Larger: none < 1 and ≤ 20 % of cells < 5 | `supuesto_frecuencias`, `detalle_supuestos` |
+| Independent observations | can't be checked from the data | `supuesto_independencia` (always "no verificable") |
+
+**Returns** a `DataFrame` sorted by `p_valor`, one row per variable:
+`var_base`, `var_categorica`, `tabla` (`"2x2"`), `n`, `prueba`,
+`estadistico`, `gl`, `p_valor`, `v_cramer`, `frec_esperada_min`,
+`pct_celdas_esp_menor_5`, `supuesto_frecuencias`, `supuesto_independencia`,
+`detalle_supuestos`, `decision`, `conclusion`, `post_hoc`. When H0 is
+rejected, `post_hoc` lists the cells whose adjusted standardized residual
+exceeds the Bonferroni critical value, largest first, with the sign
+(`+` = more cases than expected under independence).
+
+Caveats:
+- **Raw counts only.** Weighting by an expansion factor (`PESO`) inflates
+  n and invalidates the p-value, so there is no `weights` parameter.
+- **Cluster sampling.** With the ECV's segments, observations aren't
+  independent and p-values come out optimistic.
+- **Large n.** With ~31,000 households nearly everything is significant.
+  Judge strength by `v_cramer`.
 
 ## `triple_plot`
 
@@ -404,6 +475,7 @@ This is what decides whether you can compose a module into a subplot grid.
 | `triple_plot` | no | `dict` with `fig` | when `show=True` |
 | `bivaraite_boxplot` | **no** | **nothing** | **yes** |
 | `category_vs_numeric_plot` | **no** | **nothing** | **yes** |
+| `join_plots` | **no** (plotly) | **nothing** | **yes** (`fig.show()`) |
 
 Other conventions in the modules that follow the contract:
 
@@ -423,6 +495,7 @@ Installed: `pandas`, `numpy`, `scipy`, `matplotlib`, `seaborn`, `statsmodels`,
 | Module | Needs | Status |
 | --- | --- | --- |
 | `fast_OLS` | `plotly` (plus `statsmodels`, present) | **not importable** |
+| `join_plots` | `plotly`, `scipy` | needs `plotly`, which is not in `requirements.txt` |
 | `mutual_inf_plot` | `scikit-learn` | **not importable** |
 
 ```bash
