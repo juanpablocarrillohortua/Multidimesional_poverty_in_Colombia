@@ -481,12 +481,15 @@ can be compared, plus the final fit on all of train.
 | `grupos` | `Series` | — | group of each row (e.g. `SEGMENTO`); no row's group is split across folds |
 | `cv` | splitter | `None` | defaults to `StratifiedGroupKFold(5, shuffle=True, random_state)` |
 | `random_state` | `int` | `42` | seed of the default splitter |
+| `pickle` | `bool` | `False` | cache `evaluar_cv()` results in a `.pkl` and reload them instead of retraining while nothing changed (see below) |
+| `dir_cache` | `str \| Path \| None` | `None` | cache folder; defaults to `data/cache_cv/` at the repo root (gitignored) |
 
 | Method | Returns | What it does |
 | --- | --- | --- |
 | `evaluar_cv()` | `self` | `cross_validate` with the scorers and keeps each fold's fitted model, test indices and probabilities (`scores`, `probas_cv`). Run it first |
 | `resumen_metricas()` | nothing | prints mean ± std of every metric across folds |
 | `frecuencia_variables()` | `DataFrame` | how often each feature was selected; needs steps named `imputer` and `select_vars` |
+| `coeficientes()` | `DataFrame` | per selected feature: mean and std of the model coefficient across folds, times selected and %. Needs `imputer`, `select_vars` and a linear `model` (`coef_`). For a `LogisticRegression` it adds `AOR` (adjusted odds ratio = exp of the mean coefficient, i.e. the geometric mean of the fold odds ratios) and its fold range `AOR_Min` / `AOR_Max` |
 | `curvas_pr(thresholds_to_show, ax=None)` | `Axes` | precision-recall curve per fold, with the given thresholds marked |
 | `curva_umbral(k_thresholds=None, ax=None)` | `Axes` | mean precision and recall against the threshold; stores the crossing in `k_intersect` |
 | `matriz_confusion(ax=None)` | `Axes` | confusion matrix of the out-of-fold predictions at `umbral` |
@@ -501,6 +504,17 @@ Notes:
   The global sklearn configuration is left as it was.
 - **Pipelines that ignore groups.** If no step uses `groups` (e.g. a
   `DummyClassifier`), `ajustar_final` fits without them.
+- **Cache (`pickle=True`).** The file name is a `joblib.hash` of everything
+  that determines the result:
+  - the Pipeline's hyperparameters (via `clone`, so an already fitted
+    Pipeline gives the same key);
+  - `X_train`, `y_train` and `grupos`;
+  - `umbral`, `cv` and the scikit-learn version;
+  - the module's own source.
+
+  Changing any of them creates a new file instead of loading a stale one.
+  Old files stay on disk and can be deleted by hand. Only load your own
+  cache files: unpickling can run code.
 - **Self-contained scorers.** The module keeps its own copy of the
   threshold scorers, the same as the notebook's `crear_scoring`.
 

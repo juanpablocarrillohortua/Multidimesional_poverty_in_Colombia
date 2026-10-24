@@ -21,12 +21,15 @@ configuración global.
 """
 
 from collections import Counter
+from pathlib import Path
 
+import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.base import clone
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
@@ -39,6 +42,9 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.model_selection import StratifiedGroupKFold, cross_validate
+
+# data/ está en .gitignore, así que la caché nunca se versiona
+DIR_CACHE = Path(__file__).resolve().parent.parent / "data" / "cache_cv"
 
 
 def _custom_accuracy(y_true, y_proba, threshold):
@@ -89,6 +95,14 @@ class EvaluadorCV:
     cv           : separador de pliegues. Por defecto
                    StratifiedGroupKFold(5, shuffle=True, random_state)
     random_state : semilla del separador por defecto (default 42)
+    pickle       : si es True, evaluar_cv() guarda sus resultados en un
+                   .pkl y, en las siguientes ejecuciones, los carga en vez
+                   de reentrenar mientras no cambie nada de lo que los
+                   determina (Pipeline, datos, grupos, umbral, pliegues,
+                   versión de scikit-learn o el código de este módulo)
+    dir_cache    : carpeta de los .pkl. Por defecto data/cache_cv/ en la
+                   raíz del repositorio. Cargue solo archivos propios: un
+                   pickle puede ejecutar código al abrirse.
     """
 
     def __init__(
@@ -100,6 +114,8 @@ class EvaluadorCV:
         grupos,
         cv=None,
         random_state=42,
+        pickle=False,
+        dir_cache=None,
     ):
         self.pipeline = pipeline
         self.X_train = X_train
@@ -111,6 +127,8 @@ class EvaluadorCV:
                 n_splits=5, shuffle=True, random_state=random_state
             )
         self.cv = cv
+        self.pickle = pickle
+        self.dir_cache = Path(dir_cache) if dir_cache else DIR_CACHE
         self.scores = None
         self.probas_cv = None
         self.k_intersect = None
@@ -119,10 +137,44 @@ class EvaluadorCV:
         if self.scores is None:
             raise ValueError("Primero ejecute evaluar_cv().")
 
+    def _clave_cache(self):
+        """Hash de todo lo que determina el resultado de evaluar_cv().
+
+        clone() deja solo los hiperparámetros, así que un Pipeline ya
+        ajustado da la misma clave. El código del módulo entra en la clave
+        para que cambiar los scorers invalide las cachés anteriores.
+        """
+        return joblib.hash(
+            (
+                clone(self.pipeline),
+                self.X_train,
+                self.y_train,
+                self.grupos,
+                self.umbral,
+                self.cv,
+                sklearn.__version__,
+                Path(__file__).read_bytes(),
+            )
+        )
+
     def evaluar_cv(self):
         """Corre la validación cruzada y guarda las probabilidades por
-        pliegue. Devuelve self para poder encadenar llamadas."""
+        pliegue. Devuelve self para poder encadenar llamadas.
+
+        Con pickle=True carga los resultados de la caché si ya existen
+        para estos mismos parámetros, sin reentrenar.
+        """
         print(f"umbral: {self.umbral}")
+        archivo = None
+        if self.pickle:
+            archivo = self.dir_cache / f"{self._clave_cache()}.pkl"
+            if archivo.exists():
+                cache = joblib.load(archivo)
+                self.scores = cache["scores"]
+                self.probas_cv = cache["probas_cv"]
+                print(f"Resultados cargados de caché: {archivo}")
+                return self
+
         with sklearn.config_context(enable_metadata_routing=True):
             self.scores = cross_validate(
                 estimator=self.pipeline,
@@ -146,6 +198,13 @@ class EvaluadorCV:
                 self.scores["estimator"], self.scores["indices"]["test"]
             )
         ]
+
+        if archivo is not None:
+            archivo.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(
+                {"scores": self.scores, "probas_cv": self.probas_cv}, archivo
+            )
+            print(f"Resultados guardados en caché: {archivo}")
         return self
 
     def resumen_metricas(self):
@@ -204,6 +263,90 @@ class EvaluadorCV:
         )
         print(df_frequencies.to_string(index=False))
         return df_frequencies
+
+    def coeficientes(self):
+        """Coeficientes del modelo por variable seleccionada, entre pliegues.
+
+        Requiere pasos llamados 'imputer', 'select_vars' y 'model', y un
+        modelo con coef_ (lineal).
+
+        Si el modelo es una regresión logística, agrega el AOR (odds ratio
+        ajustado): exp del coeficiente promedio, es decir, la media
+        geométrica de los odds ratio de los pliegues, y su rango entre
+        pliegues (AOR_Min, AOR_Max). Un AOR > 1 aumenta las odds del
+        objetivo y uno < 1 las reduce, por cada unidad de la variable
+        (de 0 a 1 en las proporciones, una posición en los códigos
+        ordinales) con las demás variables seleccionadas fijas.
+
+        Cautelas: LogisticRegression penaliza por defecto (L2, C=1), lo que
+        acerca un poco el AOR a 1; class_weight="balanced" mueve sobre todo
+        el intercepto, así que las pendientes siguen siendo interpretables.
+        """
+        self._requiere_cv()
+        pasos = getattr(self.pipeline, "named_steps", {})
+        if not {"imputer", "select_vars", "model"} <= set(pasos):
+            raise ValueError(
+                "El Pipeline necesita pasos llamados 'imputer', "
+                "'select_vars' y 'model' para resumir los coeficientes."
+            )
+        if not hasattr(self.scores["estimator"][0]["model"], "coef_"):
+            raise ValueError(
+                "El modelo no tiene coeficientes (coef_): solo aplica a "
+                "modelos lineales."
+            )
+
+        registros = []
+        n_folds = len(self.scores["estimator"])
+
+        for idx, pipeline in enumerate(self.scores["estimator"]):
+            imputer = pipeline.named_steps["imputer"]
+            selector = pipeline.named_steps["select_vars"]
+            modelo = pipeline.named_steps["model"]
+
+            # 1. Recuperar los nombres de las columnas que genera el
+            # SimpleImputer (incluye las variables originales y las
+            # columnas indicadoras si hubo nulos)
+            nombres_imputed = imputer.get_feature_names_out(
+                self.X_train.columns
+            )
+
+            # 2. Filtrar las columnas seleccionadas por el
+            # SequentialFeatureSelector
+            nombres_seleccionados = nombres_imputed[selector.get_support()]
+
+            # 3. Guardar variables y coeficientes de este fold
+            for var, coef in zip(nombres_seleccionados, modelo.coef_[0]):
+                registros.append(
+                    {"fold": idx, "Característica": var, "Coeficiente": coef}
+                )
+
+        df_coefs_todos = pd.DataFrame(registros)
+
+        # 4. Agrupar para ver promedio, desviación estándar y en cuántos
+        # folds fue seleccionada cada variable
+        df_resumen_coef = (
+            df_coefs_todos.groupby("Característica")["Coeficiente"]
+            .agg(
+                Coef_Promedio="mean",
+                Coef_Std="std",
+                Veces_Seleccionada="count",
+            )
+            .sort_values(by="Veces_Seleccionada", ascending=False)
+        )
+
+        df_resumen_coef["Porcentaje"] = (
+            df_resumen_coef["Veces_Seleccionada"] / n_folds
+        ) * 100
+
+        # 5. Regresión logística: odds ratio ajustado (escala log-odds
+        # promediada y luego exponenciada)
+        if isinstance(pasos["model"], LogisticRegression):
+            coefs = df_coefs_todos.groupby("Característica")["Coeficiente"]
+            df_resumen_coef["AOR"] = np.exp(df_resumen_coef["Coef_Promedio"])
+            df_resumen_coef["AOR_Min"] = np.exp(coefs.min())
+            df_resumen_coef["AOR_Max"] = np.exp(coefs.max())
+
+        return df_resumen_coef
 
     def curvas_pr(self, thresholds_to_show=(0.2, 0.4, 0.6, 0.8), ax=None):
         """Curva precisión-recall de cada pliegue con los umbrales k
