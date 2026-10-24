@@ -64,7 +64,7 @@ It gates **only `utils/` and `notebooks/`**. `domain/`, `domain_ultis/` and
 79-column lines, `py313`, rule sets E/W/F/I/N. Notebooks are linted cell by cell
 with E402 and F401 ignored. F401/F811/F841 are marked unfixable, so `make format`
 reports unused imports and variables but never removes them. Uppercase math
-names (`X`, `W`, `M`, `R`, `B`, `X_with_const`, `invW_T`) are exempt from
+names (`X`, `X_train`, `W`, `M`, `R`, `B`, `X_with_const`, `invW_T`) are exempt from
 pep8-naming.
 
 ## ECV data (`data/`, gitignored)

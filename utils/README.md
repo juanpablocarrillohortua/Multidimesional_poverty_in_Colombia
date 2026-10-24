@@ -40,6 +40,7 @@ test_features_against_target(df, ["Age_at_StudyDate", "race"], "label")
 | [`mutual_inf_plot`](mutual_inf_plot.py) | Feature relevance = correlation + mutual information | `analizar_relevancia_caracteristicas` (+4) | `DataFrame` |
 | [`vif_resume`](vif_resume.py) | Which predictors are redundant with each other? | `vif_table` | `DataFrame` |
 | [`fast_OLS`](fast_OLS.py) | Full diagnostics of a fitted OLS model | class `DiagnosticoOLS` | varies |
+| [`evaluador_cv`](evaluador_cv.py) | How does a classification Pipeline perform under grouped, stratified CV? | class `EvaluadorCV` | varies |
 
 > **Two modules do not import today.** `fast_OLS` needs `plotly` and
 > `mutual_inf_plot` needs `scikit-learn`; neither is installed. See
@@ -461,6 +462,50 @@ Wraps an already-fitted `sm.OLS(...).fit()` result.
 
 ---
 
+# Model evaluation
+
+## `evaluador_cv`
+
+### `EvaluadorCV(pipeline, X_train, y_train, umbral, grupos, ...)`
+
+The evaluation flow of `notebooks/modeling.ipynb` as one class: the same
+grouped, stratified folds and the same metrics for every model, so models
+can be compared, plus the final fit on all of train.
+
+| Parameter | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `pipeline` | `Pipeline` | — | estimator with `predict_proba`; it's cloned, never fitted in place |
+| `X_train` | `DataFrame` | — | features |
+| `y_train` | `Series` | — | binary target (0/1) |
+| `umbral` | `float` | — | decision threshold for accuracy, precision, recall, kappa and the confusion matrix |
+| `grupos` | `Series` | — | group of each row (e.g. `SEGMENTO`); no row's group is split across folds |
+| `cv` | splitter | `None` | defaults to `StratifiedGroupKFold(5, shuffle=True, random_state)` |
+| `random_state` | `int` | `42` | seed of the default splitter |
+
+| Method | Returns | What it does |
+| --- | --- | --- |
+| `evaluar_cv()` | `self` | `cross_validate` with the scorers and keeps each fold's fitted model, test indices and probabilities (`scores`, `probas_cv`). Run it first |
+| `resumen_metricas()` | nothing | prints mean ± std of every metric across folds |
+| `frecuencia_variables()` | `DataFrame` | how often each feature was selected; needs steps named `imputer` and `select_vars` |
+| `curvas_pr(thresholds_to_show, ax=None)` | `Axes` | precision-recall curve per fold, with the given thresholds marked |
+| `curva_umbral(k_thresholds=None, ax=None)` | `Axes` | mean precision and recall against the threshold; stores the crossing in `k_intersect` |
+| `matriz_confusion(ax=None)` | `Axes` | confusion matrix of the out-of-fold predictions at `umbral` |
+| `ajustar_final()` | fitted `Pipeline` | fits a copy of the Pipeline on all of `X_train` |
+
+Notes:
+- **No refitting after `evaluar_cv`.** The curves and the confusion matrix
+  reuse the fold models it already fitted.
+- **Groups reach inner CV.** Metadata routing is switched on only inside
+  `evaluar_cv` and `ajustar_final` (`sklearn.config_context`), so `groups`
+  also reaches the CV inside steps such as `SequentialFeatureSelector`.
+  The global sklearn configuration is left as it was.
+- **Pipelines that ignore groups.** If no step uses `groups` (e.g. a
+  `DummyClassifier`), `ajustar_final` fits without them.
+- **Self-contained scorers.** The module keeps its own copy of the
+  threshold scorers, the same as the notebook's `crear_scoring`.
+
+---
+
 # Shared conventions
 
 The newer plotting modules follow one contract; the two older ones do not.
@@ -476,6 +521,7 @@ This is what decides whether you can compose a module into a subplot grid.
 | `bivaraite_boxplot` | **no** | **nothing** | **yes** |
 | `category_vs_numeric_plot` | **no** | **nothing** | **yes** |
 | `join_plots` | **no** (plotly) | **nothing** | **yes** (`fig.show()`) |
+| `evaluador_cv` | yes (plot methods) | `Axes` | no |
 
 Other conventions in the modules that follow the contract:
 

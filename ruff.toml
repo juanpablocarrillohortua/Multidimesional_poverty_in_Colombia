@@ -52,6 +52,7 @@ docstring-code-format = true
 [lint.pep8-naming]
 ignore-names = [
     "X",
+    "X_train",
     "X_with_const",
     "M",
     "R",
