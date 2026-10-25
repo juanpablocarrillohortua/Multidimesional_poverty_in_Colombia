@@ -5,7 +5,8 @@ agrupada y estratificada, con un umbral de decisión explícito.
 Reúne en una clase el flujo de `notebooks/modeling.ipynb`: validación
 cruzada, resumen de métricas, frecuencia de selección de variables, curvas
 precisión-recall, compromiso precisión-recall según el umbral, matriz de
-confusión y ajuste final sobre todo train.
+confusión, intervalos de confianza por bootstrap y ajuste final sobre todo
+train.
 
 Uso::
 
@@ -36,6 +37,7 @@ from sklearn.metrics import (
     average_precision_score,
     cohen_kappa_score,
     confusion_matrix,
+    log_loss,
     make_scorer,
     precision_recall_curve,
     precision_score,
@@ -79,6 +81,37 @@ def _crear_scoring(umbral):
         # No depende del umbral: AP evalúa todos los umbrales
         "average_precision": "average_precision",
     }
+
+
+def _cox_snell_r2(model, X, y):
+    """
+    Calcula el R² de Cox & Snell para Regresión Logística.
+    Requiere probabilidades predichas del modelo.
+    """
+    n = len(y)
+    # Log-likelihood del modelo actual
+    probs = model.predict_proba(X)
+    ll_model = -log_loss(y, probs, normalize=False)
+
+    # Log-likelihood del modelo nulo (solo intercepto)
+    p_null = np.mean(y)
+    ll_null = np.sum(y * np.log(p_null) + (1 - y) * np.log(1 - p_null))
+
+    return 1 - np.exp((2 / n) * (ll_null - ll_model))
+
+
+def _nagelkerke_r2(model, X, y):
+    """
+    Calcula el R² de Nagelkerke ajustando la escala entre 0 y 1.
+    """
+    n = len(y)
+    p_null = np.mean(y)
+    ll_null = np.sum(y * np.log(p_null) + (1 - y) * np.log(1 - p_null))
+
+    cs_r2 = _cox_snell_r2(model, X, y)
+    max_r2 = 1 - np.exp((2 / n) * ll_null)
+
+    return cs_r2 / max_r2
 
 
 class EvaluadorCV:
@@ -127,11 +160,13 @@ class EvaluadorCV:
                 n_splits=5, shuffle=True, random_state=random_state
             )
         self.cv = cv
+        self.random_state = random_state
         self.pickle = pickle
         self.dir_cache = Path(dir_cache) if dir_cache else DIR_CACHE
         self.scores = None
         self.probas_cv = None
         self.k_intersect = None
+        self.bootstrap = None
 
     def _requiere_cv(self):
         if self.scores is None:
@@ -347,6 +382,147 @@ class EvaluadorCV:
             df_resumen_coef["AOR_Max"] = np.exp(coefs.max())
 
         return df_resumen_coef
+
+    def pseudo_r2(self):
+        """R² de Cox & Snell y de Nagelkerke en cada pliegue.
+
+        Solo aplica si el último paso del Pipeline es una regresión
+        logística. Se calculan fuera de muestra: cada modelo de pliegue
+        sobre los datos que dejó afuera, con el modelo nulo igual a la tasa
+        del objetivo en ese pliegue.
+
+        Cautela: con class_weight="balanced" las probabilidades se corren
+        hacia 0.5, así que la verosimilitud sobre la mezcla real de clases
+        baja y estos R² salen bajos (incluso negativos). Eso no significa
+        que el modelo ordene mal los hogares; eso lo mide el AP.
+        """
+        self._requiere_cv()
+        final = (
+            self.pipeline[-1]
+            if hasattr(self.pipeline, "named_steps")
+            else self.pipeline
+        )
+        if not isinstance(final, LogisticRegression):
+            raise ValueError(
+                "Los pseudo-R² solo aplican cuando el modelo es una "
+                "regresión logística."
+            )
+
+        filas = []
+        for estimador, idx_te in zip(
+            self.scores["estimator"], self.scores["indices"]["test"]
+        ):
+            x_te = self.X_train.iloc[idx_te]
+            y_te = self.y_train.iloc[idx_te]
+            filas.append(
+                {
+                    "Cox_Snell": _cox_snell_r2(estimador, x_te, y_te),
+                    "Nagelkerke": _nagelkerke_r2(estimador, x_te, y_te),
+                }
+            )
+
+        df_r2 = pd.DataFrame(filas)
+        df_r2.index.name = "fold"
+        # Mismo formato que resumen_metricas (np.std, ddof=0)
+        for col, val in df_r2.items():
+            print(f"{col}: {np.mean(val):.3f} ± {np.std(val):.3f}")
+        return df_r2
+
+    def bootstrap_ic(
+        self, umbral=None, n_boot=1000, alpha=0.05, random_state=None
+    ):
+        """Intervalo de confianza empírico por bootstrap de conglomerados.
+
+        Junta las predicciones fuera de muestra de todos los pliegues y
+        remuestrea grupos completos (por ejemplo, SEGMENTO) con reemplazo:
+        los hogares de un mismo segmento están correlacionados y el
+        segmento es la unidad de muestreo y de los pliegues. En cada
+        réplica se recalculan accuracy, precision, recall y kappa (con el
+        umbral) y average precision; el IC son los percentiles alpha/2 y
+        1 - alpha/2 de esa distribución empírica.
+
+        Parámetros
+        ----------
+        umbral       : umbral de decisión. Por defecto, el de la clase
+        n_boot       : número de réplicas bootstrap (default 1000)
+        alpha        : 1 - nivel de confianza (default 0.05, IC del 95 %)
+        random_state : semilla. Por defecto, la de la clase. Con la misma
+                       semilla, grupos y pliegues, todos los modelos
+                       reciben las mismas réplicas (comparación pareada)
+
+        Devuelve un DataFrame por métrica con la estimación sobre todas
+        las predicciones juntas (puede diferir un poco de la media entre
+        pliegues) y los límites del IC. La distribución queda en
+        self.bootstrap. Solo se remuestrean las predicciones, no se
+        reentrena: el IC refleja la incertidumbre de la muestra de
+        evaluación, no la del entrenamiento.
+
+        Es decir crea un vector de predicciones global y hace el bootstrap
+        sobre esos vectores, luego en cada iteracion saca valores de ese
+        vector tomando en cuenta los grupos y en base a los vecotres extraidos
+        se calculan metricas, de ese proceso nacen las distribucuiobes
+        empircas que dan pie a los IC.
+
+        Este enfoque se toma en lugar de reentrenar una y otra vez pues con
+        las Pipelines desarrolladas esto seria muy lento y se conservan las
+        ventajas de aumentar la confianza en las esimtaciones al eliminar
+        ruido de tomar solo un corte.
+        """
+        self._requiere_cv()
+        umbral = self.umbral if umbral is None else umbral
+        if random_state is None:
+            random_state = self.random_state
+
+        # Predicciones fuera de muestra en el orden de los pliegues
+        y = np.concatenate([np.asarray(y_te) for y_te, _ in self.probas_cv])
+        y = y.astype(int)
+        proba = np.concatenate([p for _, p in self.probas_cv])
+        pred = (proba >= umbral).astype(int)
+        posiciones = np.concatenate(self.scores["indices"]["test"])
+        codigos, grupos_unicos = pd.factorize(
+            np.asarray(self.grupos)[posiciones]
+        )
+        n_grupos = len(grupos_unicos)
+        # Celda de la matriz de confusión de cada fila: 0=TN, 1=FP, 2=FN,
+        # 3=TP
+        celda = 2 * y + pred
+
+        def metricas(pesos):
+            tn, fp, fn, tp = np.bincount(celda, weights=pesos, minlength=4)
+            n = tn + fp + fn + tp
+            p_o = (tp + tn) / n
+            # Acuerdo esperado por azar, a partir de las marginales
+            p_e = ((tp + fp) * (tp + fn) + (fn + tn) * (fp + tn)) / n**2
+            usar = pesos > 0
+            return {
+                "accuracy": p_o,
+                "precision": tp / (tp + fp) if tp + fp > 0 else 0.0,
+                "recall": tp / (tp + fn) if tp + fn > 0 else 0.0,
+                "kappa": (p_o - p_e) / (1 - p_e) if p_e < 1 else 0.0,
+                "average_precision": average_precision_score(
+                    y[usar], proba[usar], sample_weight=pesos[usar]
+                ),
+            }
+
+        # Cada réplica como pesos: cuántas veces salió el grupo de cada
+        # fila (equivale a repetir sus filas, sin copiarlas)
+        rng = np.random.default_rng(random_state)
+        replicas = []
+        for _ in range(n_boot):
+            conteo = np.bincount(
+                rng.integers(0, n_grupos, n_grupos), minlength=n_grupos
+            )
+            replicas.append(metricas(conteo[codigos].astype(float)))
+        self.bootstrap = pd.DataFrame(replicas)
+
+        estimacion = pd.Series(metricas(np.ones(len(y))))
+        return pd.DataFrame(
+            {
+                "estimacion": estimacion,
+                "ic_inf": self.bootstrap.quantile(alpha / 2),
+                "ic_sup": self.bootstrap.quantile(1 - alpha / 2),
+            }
+        ).rename_axis("metrica")
 
     def curvas_pr(self, thresholds_to_show=(0.2, 0.4, 0.6, 0.8), ax=None):
         """Curva precisión-recall de cada pliegue con los umbrales k

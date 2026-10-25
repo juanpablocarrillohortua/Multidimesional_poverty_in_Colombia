@@ -480,7 +480,7 @@ can be compared, plus the final fit on all of train.
 | `umbral` | `float` | — | decision threshold for accuracy, precision, recall, kappa and the confusion matrix |
 | `grupos` | `Series` | — | group of each row (e.g. `SEGMENTO`); no row's group is split across folds |
 | `cv` | splitter | `None` | defaults to `StratifiedGroupKFold(5, shuffle=True, random_state)` |
-| `random_state` | `int` | `42` | seed of the default splitter |
+| `random_state` | `int` | `42` | seed of the default splitter and default seed of `bootstrap_ic` |
 | `pickle` | `bool` | `False` | cache `evaluar_cv()` results in a `.pkl` and reload them instead of retraining while nothing changed (see below) |
 | `dir_cache` | `str \| Path \| None` | `None` | cache folder; defaults to `data/cache_cv/` at the repo root (gitignored) |
 
@@ -490,6 +490,8 @@ can be compared, plus the final fit on all of train.
 | `resumen_metricas()` | nothing | prints mean ± std of every metric across folds |
 | `frecuencia_variables()` | `DataFrame` | how often each feature was selected; needs steps named `imputer` and `select_vars` |
 | `coeficientes()` | `DataFrame` | per selected feature: mean and std of the model coefficient across folds, times selected and %. Needs `imputer`, `select_vars` and a linear `model` (`coef_`). For a `LogisticRegression` it adds `AOR` (adjusted odds ratio = exp of the mean coefficient, i.e. the geometric mean of the fold odds ratios) and its fold range `AOR_Min` / `AOR_Max` |
+| `pseudo_r2()` | `DataFrame` | Cox & Snell and Nagelkerke R² per fold, computed out of fold (each fold model on its held-out rows, null model = that fold's target rate), plus printed mean ± std. Only for a `LogisticRegression` final step. With `class_weight="balanced"` the values come out low, possibly negative, because the probabilities are shifted |
+| `bootstrap_ic(umbral=None, n_boot=1000, alpha=0.05, random_state=None)` | `DataFrame` | empirical CI from a cluster bootstrap. It pools the out-of-fold predictions and resamples whole groups (`grupos`) with replacement, recomputing accuracy, precision, recall, kappa (at `umbral`, default the class's) and average precision. Columns `estimacion` (on all pooled predictions), `ic_inf` / `ic_sup` (percentiles α/2 and 1 − α/2). The distribution stays in `bootstrap`. Same seed, groups and folds give every model the same resamples (paired). No refitting: it covers the uncertainty of the evaluation sample, not of training |
 | `curvas_pr(thresholds_to_show, ax=None)` | `Axes` | precision-recall curve per fold, with the given thresholds marked |
 | `curva_umbral(k_thresholds=None, ax=None)` | `Axes` | mean precision and recall against the threshold; stores the crossing in `k_intersect` |
 | `matriz_confusion(ax=None)` | `Axes` | confusion matrix of the out-of-fold predictions at `umbral` |
@@ -513,7 +515,9 @@ Notes:
   - the module's own source.
 
   Changing any of them creates a new file instead of loading a stale one.
-  Old files stay on disk and can be deleted by hand. Only load your own
+  Any edit to `evaluador_cv.py` therefore invalidates every cache, and
+  every model retrains on its next `evaluar_cv()`. Old files stay on disk
+  and can be deleted by hand. Only load your own
   cache files: unpickling can run code.
 - **Self-contained scorers.** The module keeps its own copy of the
   threshold scorers, the same as the notebook's `crear_scoring`.
