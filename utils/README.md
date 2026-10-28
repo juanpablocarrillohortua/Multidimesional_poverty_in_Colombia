@@ -494,6 +494,7 @@ can be compared, plus the final fit on all of train.
 | `bootstrap_ic(umbral=None, n_boot=1000, alpha=0.05, random_state=None)` | `DataFrame` | empirical CI from a cluster bootstrap. It pools the out-of-fold predictions and resamples whole groups (`grupos`) with replacement, recomputing accuracy, precision, recall, kappa (at `umbral`, default the class's) and average precision. Columns `estimacion` (on all pooled predictions), `ic_inf` / `ic_sup` (percentiles α/2 and 1 − α/2). The distribution stays in `bootstrap`. Same seed, groups and folds give every model the same resamples (paired). No refitting: it covers the uncertainty of the evaluation sample, not of training |
 | `curvas_pr(thresholds_to_show, ax=None)` | `Axes` | precision-recall curve per fold, with the given thresholds marked |
 | `curva_umbral(k_thresholds=None, ax=None)` | `Axes` | mean precision and recall against the threshold; stores the crossing in `k_intersect` |
+| `comparar_train_test(ax=None)` | `Axes` | grouped bars of every metric's mean ± std across folds, train next to test, to spot overfitting. Train scores come from the fold models `evaluar_cv` already fitted, scored on their own training rows with the same scorers and `umbral` (no refitting). The table (`train_media`, `train_std`, `test_media`, `test_std`, `brecha` = train − test) is stored in `train_test` |
 | `matriz_confusion(ax=None)` | `Axes` | confusion matrix of the out-of-fold predictions at `umbral` |
 | `ajustar_final()` | fitted `Pipeline` | fits a copy of the Pipeline on all of `X_train` |
 

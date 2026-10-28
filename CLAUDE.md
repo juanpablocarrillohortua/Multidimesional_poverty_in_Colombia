@@ -13,11 +13,22 @@ PLOS ONE 19(5): e0300263, whose PDF is in `docs/`.
 Pipeline, in order:
 
 1. `domain_ultis/unzip_year.py` extracts the raw zips (see ECV data below).
-2. `notebooks/eda_consolidate.ipynb` is the main notebook. It merges every ECV
-   table into one person-level frame (235,350 × 902), filters to cities
-   (`CLASE == 1`), runs `domain.ipm.IPM` to get one row per household with the
-   `POBRE` target, then starts feature EDA and imputation.
-3. `notebooks/consolidate_dfs.ipynb` and `full_analisis.ipynb` are earlier
+2. `notebooks/eda_consolidate.ipynb` merges every ECV table into one
+   person-level frame (235,350 × 902), filters to cities (`CLASE == 1`), runs
+   `domain.ipm.IPM` to get one row per household with the `POBRE` target, does
+   the EDA, and **exports `data/splits/{train,val,test}.pkl`**. Those files hold
+   household rows with the keys, `SEGMENTO`, `PESO`, the `ORG_*` features
+   (renamed) and `POBRE`.
+   - The split is 70/15/15: `StratifiedGroupKFold(20)` over households,
+     stratified by `POBRE` and grouped by `SEGMENTO`, `random_state=42`;
+     3 folds go to test, 3 to val and 14 to train.
+   - Re-running the notebook rewrites the splits, so any change upstream of
+     the export has to be re-run before modeling.
+3. `notebooks/modeling.ipynb` (the main one) and `modelling2.ipynb` only read
+   the pickles. They compare pipelines (logistic regression, L1, LDA,
+   Naive Bayes, KNN, and SMOTE/ADASYN/undersampling via `imblearn.pipeline`)
+   with `utils.evaluador_cv.EvaluadorCV`, grouped by `SEGMENTO`.
+4. `notebooks/consolidate_dfs.ipynb` and `full_analisis.ipynb` are earlier
    explorations that worked out the join keys. They are reference material,
    not part of the pipeline.
 
@@ -28,8 +39,10 @@ Pipeline, in order:
 
 ## Environment and commands
 
-Windows, Python 3.13 venv at `.venv/` (`.venv/Scripts/python.exe`). `make` is
-installed, and the Makefile uses the venv interpreter automatically.
+Two contributors, two OSes: a Windows venv (`.venv/Scripts/python.exe`) and a
+macOS one (`.venv/bin/python`, Python 3.14). The Makefile picks whichever venv
+exists, so prefer `make` targets over hard-coded interpreter paths. CI and
+`ruff.toml` target 3.13.
 
 ```bash
 make install        # runtime deps from requirements.txt
@@ -38,16 +51,22 @@ make lint           # ruff check utils/ and notebooks/ (lint-py / lint-nb for on
 make format         # ruff --fix (never deletes code) + ruff format
 make quality        # clean + lint + format-check: read-only gate, same as CI
 make clean          # tools/clean.py: __pycache__, .ipynb_checkpoints, tool caches
-.venv/Scripts/python.exe -m ruff check utils/fancy_hist.py   # a single file
+.venv/bin/python -m ruff check utils/fancy_hist.py   # a single file (.venv/Scripts/python.exe on Windows)
 python domain_ultis/unzip_year.py data/ECV_2025              # extract a survey year
 ```
 
-`requirements.txt` pins pandas 3.0, numpy, scikit-learn, scipy, statsmodels,
-matplotlib, seaborn and Jupyter. It was frozen on another machine, so the local
-venv can fall behind it: if `domain.ipm` or a `utils/` module raises
-`ModuleNotFoundError`, run `make install`. `plotly`, which `utils/fast_OLS.py`
-needs, is not in it. pandas 3.0 has Copy-on-Write always on (chained assignment
-does not modify the frame) and a default `str` dtype for text columns.
+`requirements.txt` is a full `pip freeze`: pandas 3.0, numpy, scikit-learn,
+imbalanced-learn, scipy, statsmodels, matplotlib, seaborn, plotly, missingno
+and Jupyter.
+- It is **UTF-16 LE with CRLF**, frozen from PowerShell. pip reads it, but
+  `grep`, `git diff` and the Read tool treat it as binary. Read it with
+  `iconv -f UTF-16 -t UTF-8 requirements.txt`, and keep that encoding (or
+  convert the whole file deliberately) when you edit it.
+- If an import raises `ModuleNotFoundError`, the local venv has fallen behind
+  the file: run `make install`.
+
+pandas 3.0 has Copy-on-Write always on (chained assignment does not modify the
+frame) and a default `str` dtype for text columns.
 
 `make quality` runs in CI on every push and pull request to `main`
 (`.github/workflows/quality.yml`): `ubuntu-latest`, Python 3.13, ruff only.
@@ -69,8 +88,10 @@ pep8-naming.
 
 ## ECV data (`data/`, gitignored)
 
-`data/ECV_2025/` holds one zip per survey module, each with the same table as
-`.csv`, `.DTA` and `.sav`. `data/ECV_2023/` is empty. Notebooks don't read the
+`data/ECV_2025/` is downloaded by hand from the Google Drive folder linked in
+`README.md`. It holds one zip per survey module, each with the same table as
+`.csv`, `.DTA` and `.sav` (none of them carry value labels). Besides the raw
+data, `data/` holds the generated `splits/` and `cache_cv/`. Notebooks don't read the
 zips: `unzip_year.py` flattens them into
 `data/extracted/ECV_2025_extracted/<ext>/` (fixing cp437-mangled accented
 names), and notebooks read `config.EXTRACTED / "ECV_2025_extracted" / "csv"`.
@@ -161,6 +182,23 @@ that don't exist.
 `domain/` doesn't follow the `utils/` rules below: identifiers are Spanish,
 plotters return a `Figure` rather than accept `ax`, and it imports sklearn and
 scipy at module level.
+
+## Model evaluation: `utils/evaluador_cv.py`
+
+`EvaluadorCV(pipeline, X_train, y_train, umbral, grupos)` is the one class in
+`utils/` that isn't a plotter, and every model in the modeling notebooks goes
+through it.
+- `evaluar_cv()` runs `StratifiedGroupKFold(5)` by default.
+- Accuracy, precision, recall, kappa and the confusion matrix use the
+  explicit decision threshold `umbral`, not `predict`.
+- `grupos` (`SEGMENTO`) reaches the inner CV of steps such as
+  `SequentialFeatureSelector` through sklearn metadata routing, which is
+  switched on only inside a `config_context`.
+- With `pickle=True`, results are cached in `data/cache_cv/` under a
+  `joblib.hash` of the cloned pipeline, the data, the groups, the threshold,
+  the CV, the sklearn version **and the source of `evaluador_cv.py`**. Any
+  edit to that module silently invalidates every cache, so the next notebook
+  run retrains everything.
 
 ## `utils/` analysis toolkit
 

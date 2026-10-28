@@ -4,9 +4,9 @@ agrupada y estratificada, con un umbral de decisión explícito.
 
 Reúne en una clase el flujo de `notebooks/modeling.ipynb`: validación
 cruzada, resumen de métricas, frecuencia de selección de variables, curvas
-precisión-recall, compromiso precisión-recall según el umbral, matriz de
-confusión, intervalos de confianza por bootstrap y ajuste final sobre todo
-train.
+precisión-recall, compromiso precisión-recall según el umbral, comparación
+de métricas en train y test, matriz de confusión, intervalos de confianza
+por bootstrap y ajuste final sobre todo train.
 
 Uso::
 
@@ -37,6 +37,7 @@ from sklearn.metrics import (
     average_precision_score,
     cohen_kappa_score,
     confusion_matrix,
+    get_scorer,
     log_loss,
     make_scorer,
     precision_recall_curve,
@@ -166,6 +167,7 @@ class EvaluadorCV:
         self.scores = None
         self.probas_cv = None
         self.k_intersect = None
+        self.train_test = None
         self.bootstrap = None
 
     def _requiere_cv(self):
@@ -683,6 +685,91 @@ class EvaluadorCV:
         ax.set_ylim(0, 1.02)
         ax.legend(loc="best")
         ax.grid(True, linestyle="--", alpha=0.5)
+        ax.figure.tight_layout()
+        return ax
+
+    def comparar_train_test(self, ax=None):
+        """Media ± desviación estándar de cada métrica en train y en test
+        entre pliegues, para ver el sobreajuste.
+
+        Las métricas de train salen de los modelos que ya ajustó
+        evaluar_cv(), evaluados sobre las filas con las que se entrenó
+        cada pliegue, con los mismos scorers y el mismo umbral (sin
+        reentrenar). Los muestreadores (SMOTE, ADASYN, submuestreo) solo
+        actúan en fit, así que train se mide sobre las filas originales.
+
+        Guarda la tabla en self.train_test: medias, desviaciones y la
+        brecha (train - test) por métrica.
+        """
+        self._requiere_cv()
+        scoring = _crear_scoring(self.umbral)
+        metricas = list(scoring)
+
+        # 1. Métricas de train por pliegue con los modelos ya ajustados
+        filas_train = []
+        for estimador, idx_tr in zip(
+            self.scores["estimator"], self.scores["indices"]["train"]
+        ):
+            x_tr = self.X_train.iloc[idx_tr]
+            y_tr = self.y_train.iloc[idx_tr]
+            filas_train.append(
+                {
+                    m: get_scorer(s)(estimador, x_tr, y_tr)
+                    for m, s in scoring.items()
+                }
+            )
+        df_train = pd.DataFrame(filas_train)
+
+        # 2. Resumen entre pliegues (np.std, ddof=0, como en
+        # resumen_metricas)
+        test = {m: np.asarray(self.scores[f"test_{m}"]) for m in metricas}
+        tabla = pd.DataFrame(
+            {
+                "train_media": [df_train[m].mean() for m in metricas],
+                "train_std": [np.std(df_train[m]) for m in metricas],
+                "test_media": [test[m].mean() for m in metricas],
+                "test_std": [np.std(test[m]) for m in metricas],
+            },
+            index=pd.Index(metricas, name="metrica"),
+        )
+        tabla["brecha"] = tabla["train_media"] - tabla["test_media"]
+        self.train_test = tabla
+
+        # 3. Barras agrupadas: train y test por métrica
+        if ax is None:
+            _, ax = plt.subplots(figsize=(9, 5))
+
+        x = np.arange(len(metricas))
+        ancho = 0.38
+        for desplazamiento, conjunto, color in (
+            (-ancho / 2, "train", "#1f77b4"),
+            (ancho / 2, "test", "#ff7f0e"),
+        ):
+            barras = ax.bar(
+                x + desplazamiento,
+                tabla[f"{conjunto}_media"],
+                ancho,
+                yerr=tabla[f"{conjunto}_std"],
+                capsize=4,
+                color=color,
+                alpha=0.85,
+                label=f"{conjunto.capitalize()} (media ± std)",
+            )
+            ax.bar_label(barras, fmt="%.3f", padding=3, fontsize=8)
+
+        # El kappa puede ser negativo: el eje baja si hace falta
+        minimo = (
+            tabla[["train_media", "test_media"]].to_numpy()
+            - tabla[["train_std", "test_std"]].to_numpy()
+        ).min()
+        ax.axhline(0, color="grey", lw=0.8)
+        ax.set_xticks(x, metricas)
+        ax.set_xlabel("Métrica")
+        ax.set_ylabel("Puntaje")
+        ax.set_title("Métricas promedio entre pliegues: train vs test")
+        ax.set_ylim(min(0, minimo - 0.05), 1.05)
+        ax.legend(loc="best")
+        ax.grid(True, axis="y", linestyle="--", alpha=0.5)
         ax.figure.tight_layout()
         return ax
 
