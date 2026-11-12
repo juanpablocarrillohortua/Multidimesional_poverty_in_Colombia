@@ -480,7 +480,10 @@ can be compared, plus the final fit on all of train.
 | `umbral` | `float` | — | decision threshold for accuracy, precision, recall, kappa and the confusion matrix |
 | `grupos` | `Series` | — | group of each row (e.g. `SEGMENTO`); no row's group is split across folds |
 | `cv` | splitter | `None` | defaults to `StratifiedGroupKFold(5, shuffle=True, random_state)` |
-| `random_state` | `int` | `42` | seed of the default splitter and default seed of `bootstrap_ic` |
+| `grid` | `dict \| None` | `None` | `param_grid` for a `GridSearchCV` nested in each outer fold (e.g. `{"model__C": [0.1, 1, 10]}`): hyperparameters are tuned only on that fold's training rows, with an inner `StratifiedGroupKFold(5)` seeded `random_state + 1`. `None` means no search |
+| `target_score` | `str` | `"average_precision"` | scorer `GridSearchCV` uses to pick the hyperparameters |
+| `n_jobs` | `int` | `-1` | processes for `GridSearchCV` |
+| `random_state` | `int` | `42` | seed of the default splitter, of the inner grid splitter (`+ 1`) and default seed of `bootstrap_ic` |
 | `pickle` | `bool` | `False` | cache `evaluar_cv()` results in a `.pkl` and reload them instead of retraining while nothing changed (see below) |
 | `dir_cache` | `str \| Path \| None` | `None` | cache folder; defaults to `data/cache_cv/` at the repo root (gitignored) |
 
@@ -496,7 +499,8 @@ can be compared, plus the final fit on all of train.
 | `curva_umbral(k_thresholds=None, ax=None)` | `Axes` | mean precision and recall against the threshold; stores the crossing in `k_intersect` |
 | `comparar_train_test(ax=None)` | `Axes` | grouped bars of every metric's mean ± std across folds, train next to test, to spot overfitting. Train scores come from the fold models `evaluar_cv` already fitted, scored on their own training rows with the same scorers and `umbral` (no refitting). The table (`train_media`, `train_std`, `test_media`, `test_std`, `brecha` = train − test) is stored in `train_test` |
 | `matriz_confusion(ax=None)` | `Axes` | confusion matrix of the out-of-fold predictions at `umbral` |
-| `ajustar_final()` | fitted `Pipeline` | fits a copy of the Pipeline on all of `X_train` |
+| `mejores_parametros()` | `DataFrame` | hyperparameters `GridSearchCV` chose in each outer fold (`best_params_`); only with `grid` |
+| `ajustar_final()` | fitted `Pipeline` (or `GridSearchCV`) | fits a copy of the Pipeline on all of `X_train`. With `grid` it returns the fitted `GridSearchCV`, searched on all of train; the winning Pipeline is in `best_estimator_` |
 
 Notes:
 - **No refitting after `evaluar_cv`.** The curves and the confusion matrix
@@ -507,12 +511,19 @@ Notes:
   The global sklearn configuration is left as it was.
 - **Pipelines that ignore groups.** If no step uses `groups` (e.g. a
   `DummyClassifier`), `ajustar_final` fits without them.
+- **Hyperparameter search (`grid`).** `self.pipeline` is never replaced:
+  the `GridSearchCV` is built fresh on each call, so `evaluar_cv()` can run
+  again. The fold models in `scores["estimator"]` are `GridSearchCV`
+  objects; `frecuencia_variables()` and `coeficientes()` read each fold's
+  `best_estimator_`. With `grid` and `SequentialFeatureSelector` together the
+  CV is triply nested (outer folds × grid folds × selector folds), so it is
+  much slower: use `pickle=True`.
 - **Cache (`pickle=True`).** The file name is a `joblib.hash` of everything
   that determines the result:
   - the Pipeline's hyperparameters (via `clone`, so an already fitted
     Pipeline gives the same key);
   - `X_train`, `y_train` and `grupos`;
-  - `umbral`, `cv` and the scikit-learn version;
+  - `umbral`, `cv`, `grid`, `target_score` and the scikit-learn version;
   - the module's own source.
 
   Changing any of them creates a new file instead of loading a stale one.

@@ -44,7 +44,11 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import StratifiedGroupKFold, cross_validate
+from sklearn.model_selection import (
+    GridSearchCV,
+    StratifiedGroupKFold,
+    cross_validate,
+)
 
 # data/ está en .gitignore, así que la caché nunca se versiona
 DIR_CACHE = Path(__file__).resolve().parent.parent / "data" / "cache_cv"
@@ -128,6 +132,15 @@ class EvaluadorCV:
     grupos       : Series con el grupo de cada fila (por ejemplo, SEGMENTO)
     cv           : separador de pliegues. Por defecto
                    StratifiedGroupKFold(5, shuffle=True, random_state)
+    grid         : param_grid para GridSearchCV (por ejemplo
+                   {"model__C": [0.1, 1, 10]}). Si se da, cada pliegue
+                   busca los hiperparámetros solo con sus filas de
+                   entrenamiento (validación cruzada anidada), con un
+                   StratifiedGroupKFold(5) interno de semilla
+                   random_state + 1. Por defecto None: sin búsqueda
+    target_score : métrica con la que GridSearchCV elige los
+                   hiperparámetros (default "average_precision")
+    n_jobs       : procesos de GridSearchCV (default -1, todos)
     random_state : semilla del separador por defecto (default 42)
     pickle       : si es True, evaluar_cv() guarda sus resultados en un
                    .pkl y, en las siguientes ejecuciones, los carga en vez
@@ -147,6 +160,9 @@ class EvaluadorCV:
         umbral,
         grupos,
         cv=None,
+        grid=None,
+        target_score="average_precision",
+        n_jobs=-1,
         random_state=42,
         pickle=False,
         dir_cache=None,
@@ -160,6 +176,10 @@ class EvaluadorCV:
             cv = StratifiedGroupKFold(
                 n_splits=5, shuffle=True, random_state=random_state
             )
+        # Pliegues internos de GridSearchCV, distintos de los externos
+        self.cv_grid = StratifiedGroupKFold(
+            n_splits=5, shuffle=True, random_state=random_state + 1
+        )
         self.cv = cv
         self.random_state = random_state
         self.pickle = pickle
@@ -169,10 +189,45 @@ class EvaluadorCV:
         self.k_intersect = None
         self.train_test = None
         self.bootstrap = None
+        self.grid = grid
+        self.target_score = target_score
+        self.n_jobs = n_jobs
 
     def _requiere_cv(self):
         if self.scores is None:
             raise ValueError("Primero ejecute evaluar_cv().")
+
+    def _estimador(self):
+        """Pipeline a validar; envuelto en GridSearchCV si hay grid.
+
+        No modifica self.pipeline, así que se puede llamar varias veces.
+        """
+        if self.grid is None:
+            return self.pipeline
+        return GridSearchCV(
+            estimator=self.pipeline,
+            param_grid=self.grid,
+            cv=self.cv_grid,
+            scoring=self.target_score,
+            n_jobs=self.n_jobs,
+        )
+
+    @staticmethod
+    def _ajustado(estimador):
+        """Pipeline de un pliegue: el mejor de la búsqueda si hubo grid."""
+        return getattr(estimador, "best_estimator_", estimador)
+
+    def mejores_parametros(self):
+        """Hiperparámetros que GridSearchCV eligió en cada pliegue."""
+        self._requiere_cv()
+        if self.grid is None:
+            raise ValueError(
+                "No hubo búsqueda de hiperparámetros: pase grid al crear "
+                "el EvaluadorCV."
+            )
+        return pd.DataFrame(
+            [estimador.best_params_ for estimador in self.scores["estimator"]]
+        ).rename_axis("fold")
 
     def _clave_cache(self):
         """Hash de todo lo que determina el resultado de evaluar_cv().
@@ -189,6 +244,8 @@ class EvaluadorCV:
                 self.grupos,
                 self.umbral,
                 self.cv,
+                self.grid,
+                self.target_score,
                 sklearn.__version__,
                 Path(__file__).read_bytes(),
             )
@@ -214,7 +271,7 @@ class EvaluadorCV:
 
         with sklearn.config_context(enable_metadata_routing=True):
             self.scores = cross_validate(
-                estimator=self.pipeline,
+                estimator=self._estimador(),
                 X=self.X_train,
                 y=self.y_train,
                 params={"groups": self.grupos},
@@ -267,7 +324,8 @@ class EvaluadorCV:
 
         feature_counts = Counter()
 
-        for estimator in self.scores["estimator"]:
+        for estimador in self.scores["estimator"]:
+            estimator = self._ajustado(estimador)
             # Nombres de variables después del imputer
             feat_names = estimator.named_steps[
                 "imputer"
@@ -326,7 +384,8 @@ class EvaluadorCV:
                 "El Pipeline necesita pasos llamados 'imputer', "
                 "'select_vars' y 'model' para resumir los coeficientes."
             )
-        if not hasattr(self.scores["estimator"][0]["model"], "coef_"):
+        primero = self._ajustado(self.scores["estimator"][0])
+        if not hasattr(primero["model"], "coef_"):
             raise ValueError(
                 "El modelo no tiene coeficientes (coef_): solo aplica a "
                 "modelos lineales."
@@ -335,7 +394,8 @@ class EvaluadorCV:
         registros = []
         n_folds = len(self.scores["estimator"])
 
-        for idx, pipeline in enumerate(self.scores["estimator"]):
+        for idx, estimador in enumerate(self.scores["estimator"]):
+            pipeline = self._ajustado(estimador)
             imputer = pipeline.named_steps["imputer"]
             selector = pipeline.named_steps["select_vars"]
             modelo = pipeline.named_steps["model"]
@@ -460,14 +520,14 @@ class EvaluadorCV:
         evaluación, no la del entrenamiento.
 
         Es decir crea un vector de predicciones global y hace el bootstrap
-        sobre esos vectores, luego en cada iteracion saca valores de ese
-        vector tomando en cuenta los grupos y en base a los vecotres extraidos
-        se calculan metricas, de ese proceso nacen las distribucuiobes
-        empircas que dan pie a los IC.
+        sobre esos vectores, luego en cada iteración saca valores de ese
+        vector tomando en cuenta los grupos y en base a los vectores
+        extraídos se calculan métricas, de ese proceso nacen las
+        distribuciones empíricas que dan pie a los IC.
 
         Este enfoque se toma en lugar de reentrenar una y otra vez pues con
-        las Pipelines desarrolladas esto seria muy lento y se conservan las
-        ventajas de aumentar la confianza en las esimtaciones al eliminar
+        las Pipelines desarrolladas esto sería muy lento y se conservan las
+        ventajas de aumentar la confianza en las estimaciones al eliminar
         ruido de tomar solo un corte.
         """
         self._requiere_cv()
@@ -792,8 +852,13 @@ class EvaluadorCV:
         return disp.ax_
 
     def ajustar_final(self):
-        """Ajusta una copia del Pipeline sobre todo train y la devuelve."""
-        modelo = clone(self.pipeline)
+        """Ajusta una copia del Pipeline sobre todo train y la devuelve.
+
+        Con grid devuelve el GridSearchCV ajustado: busca los
+        hiperparámetros en todo train y el Pipeline ganador queda en
+        best_estimator_.
+        """
+        modelo = clone(self._estimador())
         with sklearn.config_context(enable_metadata_routing=True):
             try:
                 modelo.fit(self.X_train, self.y_train, groups=self.grupos)
