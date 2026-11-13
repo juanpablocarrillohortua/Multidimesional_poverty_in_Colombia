@@ -194,11 +194,17 @@ through it.
 - `grupos` (`SEGMENTO`) reaches the inner CV of steps such as
   `SequentialFeatureSelector` through sklearn metadata routing, which is
   switched on only inside a `config_context`.
-- With `pickle=True`, results are cached in `data/cache_cv/` under a
-  `joblib.hash` of the cloned pipeline, the data, the groups, the threshold,
-  the CV, the sklearn version **and the source of `evaluador_cv.py`**. Any
-  edit to that module silently invalidates every cache, so the next notebook
-  run retrains everything.
+- Caching is **on by default** (`cache=True`; the old `pickle=` keyword
+  still works and overrides it). `evaluar_cv()` wraps the module-level
+  `_validar_cruzado` with `utils.cache.cached`, writing
+  `data/cache_cv/cv_<key>.pkl` with joblib. The key is a content hash
+  (`utils.cache.content_hash`) of the cloned pipeline (or its
+  `GridSearchCV`), the data and groups **by value**, the threshold, the CV,
+  the sklearn version, and the source of `_validar_cruzado` and the scorers.
+  Only edits to those two invalidate the cache; `evaluar_cv(recalcular=True)`
+  forces a retrain. Don't go back to `joblib.hash` on DataFrames: it depends
+  on the memory layout, so `X` and `X.copy()` hash differently and the cache
+  never hits.
 
 ## `utils/` analysis toolkit
 
@@ -206,7 +212,7 @@ through it.
 statistical test is chosen). Update it when you change a module. Its
 "Installed / imports cleanly" section is stale. Architectural rules:
 
-- One self-contained module per analysis idea. Modules **never import each other** and `__init__.py` re-exports nothing. A helper needed by two modules is copied, not shared.
+- One self-contained module per analysis idea. Modules **never import each other**, with one exception: `evaluador_cv` imports `cached` from `utils/cache.py` (a disk cache for slow functions). `__init__.py` re-exports nothing. Otherwise, a helper needed by two modules is copied, not shared.
 - Notebooks import `utils`, `domain` and `config` by putting the repo root on the path: `sys.path.insert(0, str(Path.cwd().parent))`, then `from utils.fancy_barplot import fancy_bars`.
 - Plotting contract (used by `fancy_barplot`, `fancy_hist`, `segmented_bars`; follow it in new modules): accept `ax=None`, return the Axes, don't call `plt.show()`, and `title=None` builds the title from the column name. `bivaraite_boxplot` and `category_vs_numeric_plot` predate this contract: they call `plt.show()` and can't go into subplot grids.
 - Identifiers are in English. Figure text and `ValueError` messages are in Spanish.
