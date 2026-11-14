@@ -29,6 +29,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sklearn
+from matplotlib.colors import to_rgba
+from matplotlib.patches import Rectangle
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -54,6 +56,34 @@ from utils.cache import cached
 
 # data/ está en .gitignore, así que la caché nunca se versiona
 DIR_CACHE = Path(__file__).resolve().parent.parent / "data" / "cache_cv"
+
+# Estilo de los gráficos de estabilidad de hiperparámetros
+INK, TXT = "#0b0b0b", "#52514e"
+# Un color por conjunto de hiperparámetros, en orden fijo de frecuencia
+PALETA_CONJUNTOS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
+# Valores de un hiperparámetro: el más elegido oscuro, los demás más claros
+RAMPA_VALORES = ["#2a78d6", "#6da7ec", "#9ec5f4", "#cde2fb", "#e6f0fc"]
+# Nombres de hiperparámetros que no caben en el eje
+ABREVIATURAS = {
+    "n_features_to_select": "n_features",
+    "sampling_strategy": "sampling",
+}
+
+
+def _etiqueta_param(nombre):
+    """'select_vars__n_features_to_select' -> 'select_vars\\nn_features'."""
+    paso, _, resto = nombre.partition("__")
+    if not resto:
+        return nombre
+    resto = resto.replace("estimator__", "estimator ")
+    return f"{paso}\n{ABREVIATURAS.get(resto, resto)}"
+
+
+def _texto_valor(valor):
+    """Texto corto de un hiperparámetro: NaN es 'no aplica'."""
+    if isinstance(valor, (float, np.floating)):
+        return "no aplica" if np.isnan(valor) else f"{valor:.3g}"
+    return str(valor)
 
 
 def _custom_accuracy(y_true, y_proba, threshold):
@@ -271,6 +301,26 @@ class EvaluadorCV:
         """Pipeline de un pliegue: el mejor de la búsqueda si hubo grid."""
         return getattr(estimador, "best_estimator_", estimador)
 
+    def variables_seleccionadas(self, estimador):
+        """Nombres de las variables que eligió el paso 'select_vars' de un
+        Pipeline ajustado (por ejemplo, uno de self.scores["estimator"]).
+
+        Pasa los nombres de X_train por todos los pasos anteriores al
+        selector (imputer y, si los hay, filtros o escaladores), así que la
+        máscara del selector siempre se aplica a las columnas que recibió.
+        Los pasos sin get_feature_names_out (los rebalanceos) no cambian
+        las columnas y se saltan.
+        """
+        pipeline = self._ajustado(estimador)
+        pasos = list(pipeline.named_steps)
+        nombres = np.asarray(self.X_train.columns, dtype=object)
+        for nombre in pasos[: pasos.index("select_vars")]:
+            paso = pipeline.named_steps[nombre]
+            if hasattr(paso, "get_feature_names_out"):
+                nombres = paso.get_feature_names_out(nombres)
+        mascara = pipeline.named_steps["select_vars"].get_support()
+        return np.asarray(nombres)[mascara]
+
     def mejores_parametros(self, estabilidad=False):
         """Hiperparámetros que GridSearchCV eligió en cada pliegue.
 
@@ -298,17 +348,55 @@ class EvaluadorCV:
         (grid como lista de dicts), queda como NaN y cuenta como un valor
         más ("no aplica" en el resumen).
         """
+        if not estabilidad:
+            return self._por_pliegue()
+
+        tablas = self._estabilidad()
+        conjuntos = tablas["conjuntos"]
+        parametros = tablas["parametros"]
+        params = list(parametros.index)
+        n_folds = len(tablas["por_pliegue"])
+
+        def texto(valor):
+            return "no aplica" if pd.isna(valor) else str(valor)
+
+        primero = conjuntos.iloc[0]
+        combinacion = ", ".join(f"{p}={texto(primero[p])}" for p in params)
+        print(
+            f"Conjunto más elegido: {combinacion} en "
+            f"{int(primero['Pliegues'])}/{n_folds} pliegues "
+            f"({primero['Porcentaje']:.0f} %); "
+            f"{len(conjuntos)} combinaciones distintas."
+        )
+        for param in params:
+            print(
+                f"  {param}: {texto(parametros.at[param, 'Valor_modal'])} "
+                f"en {int(parametros.at[param, 'Pliegues_modal'])}/{n_folds}"
+                f" pliegues ({parametros.at[param, 'Estabilidad']:.0f} %), "
+                f"{int(parametros.at[param, 'Valores_distintos'])} valores "
+                "distintos"
+            )
+        return {
+            k: tablas[k]
+            for k in ("por_pliegue", "conjuntos", "valores", "parametros")
+        }
+
+    def _por_pliegue(self):
+        """best_params_ de cada pliegue externo, una fila por pliegue."""
         self._requiere_cv()
         if self.grid is None:
             raise ValueError(
                 "No hubo búsqueda de hiperparámetros: pase grid al crear "
                 "el EvaluadorCV."
             )
-        por_pliegue = pd.DataFrame(
+        return pd.DataFrame(
             [estimador.best_params_ for estimador in self.scores["estimator"]]
         ).rename_axis("fold")
-        if not estabilidad:
-            return por_pliegue
+
+    def _estabilidad(self):
+        """Tablas de estabilidad de mejores_parametros(estabilidad=True),
+        sin imprimir nada. Las usan también los gráficos de estabilidad."""
+        por_pliegue = self._por_pliegue()
 
         def etiqueta(valor):
             # None queda como texto para no confundirlo con un
@@ -317,9 +405,6 @@ class EvaluadorCV:
             if isinstance(valor, (bool, int, float, str)):
                 return valor
             return repr(valor)
-
-        def texto(valor):
-            return "no aplica" if pd.isna(valor) else str(valor)
 
         params = list(por_pliegue.columns)
         # dtype object: los enteros no pasan a float por un NaN
@@ -377,29 +462,159 @@ class EvaluadorCV:
         ).reindex(params)
         parametros.index.name = "Parametro"
 
-        primero = conjuntos.iloc[0]
-        combinacion = ", ".join(f"{p}={texto(primero[p])}" for p in params)
-        print(
-            f"Conjunto más elegido: {combinacion} en "
-            f"{int(primero['Pliegues'])}/{n_folds} pliegues "
-            f"({primero['Porcentaje']:.0f} %); "
-            f"{len(conjuntos)} combinaciones distintas."
-        )
-        for param in params:
-            print(
-                f"  {param}: {texto(parametros.at[param, 'Valor_modal'])} "
-                f"en {int(parametros.at[param, 'Pliegues_modal'])}/{n_folds}"
-                f" pliegues ({parametros.at[param, 'Estabilidad']:.0f} %), "
-                f"{int(parametros.at[param, 'Valores_distintos'])} valores "
-                "distintos"
-            )
-
         return {
             "por_pliegue": por_pliegue,
             "conjuntos": conjuntos,
             "valores": valores,
             "parametros": parametros,
+            # Solo para los gráficos: None queda como "None", no como NaN
+            "etiquetas": etiquetas,
         }
+
+    def grafico_conjuntos(self, ax=None):
+        """Mosaico pliegue × hiperparámetro con el valor que eligió
+        GridSearchCV en cada pliegue externo.
+
+        El color de cada fila es el conjunto completo que eligió ese
+        pliegue: el conjunto 1 (azul) es el más elegido y los demás siguen
+        por frecuencia. Filas del mismo color eligieron la misma
+        combinación; dentro de una columna se ve qué hiperparámetro las
+        separa. Solo aplica con grid. Devuelve el Axes.
+        """
+        tablas = self._estabilidad()
+        # Las etiquetas y no best_params_ crudos: en un DataFrame un None
+        # pasa a NaN y se confundiría con "no aplica"
+        por_pliegue = tablas["etiquetas"]
+        conjuntos = tablas["conjuntos"]
+        params = list(por_pliegue.columns)
+        n_folds, n_params = por_pliegue.shape
+        # Número de conjunto (0 = el más elegido) de cada pliegue
+        conjunto_de = {
+            fold: n
+            for n, folds in enumerate(conjuntos["Folds"])
+            for fold in folds
+        }
+
+        if ax is None:
+            _, ax = plt.subplots(
+                figsize=(1.5 * n_params + 2.5, 0.55 * n_folds + 2)
+            )
+        for fila, fold in enumerate(por_pliegue.index):
+            color = PALETA_CONJUNTOS[conjunto_de[fold] % len(PALETA_CONJUNTOS)]
+            for col, param in enumerate(params):
+                ax.add_patch(
+                    Rectangle(
+                        (col - 0.5, fila - 0.5),
+                        1,
+                        1,
+                        facecolor=to_rgba(color, 0.35),
+                        edgecolor="white",
+                        linewidth=2,
+                    )
+                )
+                ax.text(
+                    col,
+                    fila,
+                    _texto_valor(por_pliegue.at[fold, param]),
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color=INK,
+                )
+
+        ax.set_xlim(-0.5, n_params - 0.5)
+        ax.set_ylim(n_folds - 0.5, -0.5)
+        ax.set_xticks(
+            range(n_params),
+            labels=[_etiqueta_param(p) for p in params],
+            fontsize=8,
+        )
+        # El conjunto también va en texto: el color no es la única pista
+        ax.set_yticks(
+            range(n_folds),
+            labels=[
+                f"Fold {fold + 1} · conj. {conjunto_de[fold] + 1}"
+                for fold in por_pliegue.index
+            ],
+            fontsize=8,
+        )
+        ax.tick_params(length=0)
+        for borde in ax.spines.values():
+            borde.set_visible(False)
+
+        primero = conjuntos.iloc[0]
+        ax.set_title(
+            f"Conjunto modal en {int(primero['Pliegues'])}/{n_folds} "
+            f"pliegues ({primero['Porcentaje']:.0f} %) · "
+            f"{len(conjuntos)} combinaciones"
+        )
+        return ax
+
+    def grafico_parametros(self, ax=None):
+        """Barra 100 % por hiperparámetro: cada segmento es un valor y su
+        ancho, el % de pliegues externos que lo eligieron.
+
+        El valor más elegido va primero, en azul; los demás siguen en
+        tonos más claros. La estabilidad (ancho del primer segmento) se
+        anota a la derecha. Solo aplica con grid. Devuelve el Axes.
+        """
+        tablas = self._estabilidad()
+        valores = tablas["valores"]
+        parametros = tablas["parametros"]
+        params = list(parametros.index)
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(9, 0.7 * len(params) + 1.5))
+        for fila, param in enumerate(params):
+            # valores ya viene ordenado: el modal primero
+            datos = valores[valores["Parametro"] == param]
+            izquierda = 0.0
+            for rango, (valor, porcentaje) in enumerate(
+                zip(datos["Valor"], datos["Porcentaje"])
+            ):
+                ax.barh(
+                    fila,
+                    porcentaje,
+                    left=izquierda,
+                    height=0.6,
+                    color=RAMPA_VALORES[min(rango, len(RAMPA_VALORES) - 1)],
+                    edgecolor="white",
+                    linewidth=2,
+                )
+                # Segmentos angostos sin texto para que no se monte
+                if porcentaje >= 20:
+                    ax.text(
+                        izquierda + porcentaje / 2,
+                        fila,
+                        _texto_valor(valor),
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                        color="white" if rango == 0 else INK,
+                    )
+                izquierda += porcentaje
+            ax.text(
+                101.5,
+                fila,
+                f"{parametros.at[param, 'Estabilidad']:.0f} %",
+                va="center",
+                fontsize=8,
+                color=TXT,
+            )
+
+        ax.set_xlim(0, 100)
+        ax.set_ylim(len(params) - 0.5, -0.5)
+        ax.set_yticks(
+            range(len(params)),
+            labels=[_etiqueta_param(p) for p in params],
+            fontsize=8,
+        )
+        ax.set_xlabel("% de pliegues")
+        ax.set_title("Estabilidad por hiperparámetro")
+        ax.tick_params(axis="y", length=0)
+        for lado in ("top", "right", "left"):
+            ax.spines[lado].set_visible(False)
+        return ax
 
     def evaluar_cv(self, recalcular=False):
         """Corre la validación cruzada y guarda las probabilidades por
@@ -457,18 +672,8 @@ class EvaluadorCV:
         feature_counts = Counter()
 
         for estimador in self.scores["estimator"]:
-            estimator = self._ajustado(estimador)
-            # Nombres de variables después del imputer
-            feat_names = estimator.named_steps[
-                "imputer"
-            ].get_feature_names_out(self.X_train.columns)
-
-            # Máscara de las variables seleccionadas en este fold
-            mask = estimator.named_steps["select_vars"].get_support()
-
-            # Acumular las variables seleccionadas
-            selected_in_fold = feat_names[mask]
-            feature_counts.update(selected_in_fold)
+            # Variables seleccionadas en este fold
+            feature_counts.update(self.variables_seleccionadas(estimador))
 
         # 2. Convertir a DataFrame para presentar los resultados organizados
         n_folds = len(self.scores["estimator"])
@@ -527,21 +732,11 @@ class EvaluadorCV:
         n_folds = len(self.scores["estimator"])
 
         for idx, estimador in enumerate(self.scores["estimator"]):
-            pipeline = self._ajustado(estimador)
-            imputer = pipeline.named_steps["imputer"]
-            selector = pipeline.named_steps["select_vars"]
-            modelo = pipeline.named_steps["model"]
+            modelo = self._ajustado(estimador).named_steps["model"]
 
-            # 1. Recuperar los nombres de las columnas que genera el
-            # SimpleImputer (incluye las variables originales y las
-            # columnas indicadoras si hubo nulos)
-            nombres_imputed = imputer.get_feature_names_out(
-                self.X_train.columns
-            )
-
-            # 2. Filtrar las columnas seleccionadas por el
-            # SequentialFeatureSelector
-            nombres_seleccionados = nombres_imputed[selector.get_support()]
+            # 1-2. Variables que eligió el selector (los nombres pasan por
+            # el imputer y por los pasos que haya antes del selector)
+            nombres_seleccionados = self.variables_seleccionadas(estimador)
 
             # 3. Guardar variables y coeficientes de este fold
             for var, coef in zip(nombres_seleccionados, modelo.coef_[0]):

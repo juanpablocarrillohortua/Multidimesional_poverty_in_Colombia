@@ -28,6 +28,16 @@ Pipeline, in order:
    the pickles. They compare pipelines (logistic regression, L1, LDA,
    Naive Bayes, KNN, and SMOTE/ADASYN/undersampling via `imblearn.pipeline`)
    with `utils.evaluador_cv.EvaluadorCV`, grouped by `SEGMENTO`.
+   - **`test.pkl` stays unopened until the project's final evaluation.**
+     Model selection uses train (CV) and val only.
+   - Column roles: `LLAVES = [DIRECTORIO, SECUENCIA_P]` (traceability only),
+     `GRUPO = SEGMENTO`, `PESO` (only for weighted fits), `OBJETIVO = POBRE`.
+     Every other column is a feature (`CARACTERISTICAS`).
+   - The first cell calls `sklearn.set_config(enable_metadata_routing=True)`
+     globally, so `groups` reach `SequentialFeatureSelector`'s inner CV.
+   - It still defines its own copies of the threshold scorers and
+     pseudo-R² functions. `EvaluadorCV` doesn't use them: edit the module's
+     versions.
 4. `notebooks/consolidate_dfs.ipynb` and `full_analisis.ipynb` are earlier
    explorations that worked out the join keys. They are reference material,
    not part of the pipeline.
@@ -35,7 +45,9 @@ Pipeline, in order:
 `config.py` defines `config.WORKDIR`, `config.DATADIR` (`data/`) and
 `config.EXTRACTED` (`data/extracted/`). `Dockerfile`, `.dockerignore` and
 `.env` are empty placeholders. Generated figures and tables go in
-`outputs/plots/` and `outputs/tables/`.
+`outputs/plots/` and `outputs/tables/`. `docs/MACHINE_LEARNING_ENTREGA_2.pdf`
+is the submitted second-draft course report, and `references.bib` holds its
+bibliography.
 
 ## Environment and commands
 
@@ -91,7 +103,9 @@ pep8-naming.
 `data/ECV_2025/` is downloaded by hand from the Google Drive folder linked in
 `README.md`. It holds one zip per survey module, each with the same table as
 `.csv`, `.DTA` and `.sav` (none of them carry value labels). Besides the raw
-data, `data/` holds the generated `splits/` and `cache_cv/`. Notebooks don't read the
+data, `data/` holds the generated `splits/`, `cache_cv/` (`EvaluadorCV`
+results) and `cache_pipe/` (the `Pipeline(memory=...)` transformer cache
+that `modeling.ipynb` uses). Deleting either cache forces a retrain. Notebooks don't read the
 zips: `unzip_year.py` flattens them into
 `data/extracted/ECV_2025_extracted/<ext>/` (fixing cp437-mangled accented
 names), and notebooks read `config.EXTRACTED / "ECV_2025_extracted" / "csv"`.
@@ -194,6 +208,19 @@ through it.
 - `grupos` (`SEGMENTO`) reaches the inner CV of steps such as
   `SequentialFeatureSelector` through sklearn metadata routing, which is
   switched on only inside a `config_context`.
+- **Nested CV with `grid=`**: passing a `param_grid` (a dict or a list of
+  dicts, keys like `"model__C"`, `"select_vars__n_features_to_select"`)
+  wraps the pipeline in `GridSearchCV`, scored by `target_score`
+  (default `"average_precision"`). Each outer fold tunes only on its own
+  training rows, with an inner `StratifiedGroupKFold(5)` seeded
+  `random_state + 1`. `mejores_parametros()` shows each fold's
+  `best_params_`. With `estabilidad=True` it also reports how consistently
+  the folds chose them. `coeficientes` and `frecuencia_variables` unwrap
+  each fold's `best_estimator_` via `_ajustado()`. The other methods only
+  call `predict_proba`, which `GridSearchCV` passes through to that
+  estimator.
+  `ajustar_final()` returns the fitted `GridSearchCV`, not a bare pipeline.
+  A nested grid over a backward `SequentialFeatureSelector` is very slow.
 - Caching is **on by default** (`cache=True`; the old `pickle=` keyword
   still works and overrides it). `evaluar_cv()` wraps the module-level
   `_validar_cruzado` with `utils.cache.cached`, writing
