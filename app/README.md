@@ -67,7 +67,17 @@ El modelo fue entrenado con los datos recolectados por el DANE para la encuesta 
 
 > Nota: el umbral de decisión es de $0.45$ y se fijó en la validación cruzada para priorizar el recall, es decir, detectar la mayor cantidad posible de hogares pobres a costa de algunas falsas alarmas.
 
+
 # Ejecutar con Docker
+
+### Opción 1: Descargar desde Docker Hub (Recomendado)
+
+```bash
+docker pull juanpablocarrillo1/multi-dimensional-poverty:latest
+docker run --rm -p 8501:8501 juanpablocarrillo1/multi-dimensional-poverty:latest
+```
+
+### Opción 2: Construir localmente
 
 Desde la raíz del repositorio:
 
@@ -76,4 +86,15 @@ docker build -t pobreza-ipm .
 docker run --rm -p 8501:8501 pobreza-ipm
 ```
 
-La app queda disponible en <http://localhost:8501>.
+En ambos casos, la app queda disponible en <http://localhost:8501>.
+
+# Ejecutar localmente
+
+Desde la raíz del repositorio:
+
+```bash
+pip install -r app/requirements.txt
+streamlit run app/app.py
+```
+
+la app queda disponible en <http://localhost:8501>.
