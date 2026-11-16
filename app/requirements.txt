@@ -1,0 +1,10 @@
+# Runtime dependencies of the Streamlit app only (used by the Dockerfile).
+# Pinned to the versions the model was saved and tested with.
+streamlit==1.67.0
+scikit-learn==1.9.1  # must match the version that pickled the model
+numpy==2.5.4
+pandas==3.0.6
+scipy==1.18.1
+joblib==1.6.0
+pydantic==2.14.3
+pydantic-settings==2.16.3

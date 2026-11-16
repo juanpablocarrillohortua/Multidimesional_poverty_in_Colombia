@@ -41,10 +41,19 @@ Pipeline, in order:
 4. `notebooks/consolidate_dfs.ipynb` and `full_analisis.ipynb` are earlier
    explorations that worked out the join keys. They are reference material,
    not part of the pipeline.
+5. `app/` is the Streamlit deployment of the saved production model
+   (`models/`): `app.py` is the UI (styled by `style.css`),
+   `preprocessing.py` turns the household's raw counts into the model's
+   input row with pydantic, and `app_config.py` holds the shared settings
+   (input columns, codes, threshold, model path, field labels). Its runtime
+   deps are pinned in `app/requirements.txt` (scikit-learn must match the
+   version that pickled the model). Run it with `streamlit run app/app.py`
+   or `docker build -t pobreza-ipm . && docker run -p 8501:8501
+   pobreza-ipm`; `.dockerignore` is an allow-list (only `app/` and the
+   model enter the build context, since `data/` is ~20 GB).
 
 `config.py` defines `config.WORKDIR`, `config.DATADIR` (`data/`) and
-`config.EXTRACTED` (`data/extracted/`). `Dockerfile`, `.dockerignore` and
-`.env` are empty placeholders. Generated figures and tables go in
+`config.EXTRACTED` (`data/extracted/`). `.env` is an empty placeholder. Generated figures and tables go in
 `outputs/plots/` and `outputs/tables/`. `docs/MACHINE_LEARNING_ENTREGA_2.pdf`
 is the submitted second-draft course report, and `references.bib` holds its
 bibliography.
@@ -59,7 +68,7 @@ exists, so prefer `make` targets over hard-coded interpreter paths. CI and
 ```bash
 make install        # runtime deps from requirements.txt
 make install-dev    # ruff==0.16.7 from requirements/dev.txt
-make lint           # ruff check utils/ and notebooks/ (lint-py / lint-nb for one side)
+make lint           # ruff check utils/, app/ and notebooks/ (lint-py / lint-nb for one side)
 make format         # ruff --fix (never deletes code) + ruff format
 make quality        # clean + lint + format-check: read-only gate, same as CI
 make clean          # tools/clean.py: __pycache__, .ipynb_checkpoints, tool caches
@@ -82,9 +91,11 @@ frame) and a default `str` dtype for text columns.
 
 `make quality` runs in CI on every push and pull request to `main`
 (`.github/workflows/quality.yml`): `ubuntu-latest`, Python 3.13, ruff only.
-It gates **only `utils/` and `notebooks/`**. `domain/`, `domain_ultis/` and
-`config.py` are not linted, and `domain/` does not pass the 79-column rule
-(`ipm.py` is formatted at 88).
+It gates **only `utils/`, `app/` and `notebooks/`**. `domain/`,
+`domain_ultis/` and `config.py` are not linted, and `domain/` does not pass
+the 79-column rule (`ipm.py` is formatted at 88). `ruff.toml` ignores F401 in
+`app/` while its skeleton imports are unused: drop that line once the app
+uses them.
 
 **Scaffolding copied from other projects. Do not rely on it:**
 - `make test` / `make validate` fail: there is no `tests/` directory and pytest is not installed.
