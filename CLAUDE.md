@@ -28,6 +28,16 @@ Pipeline, in order:
    the pickles. They compare pipelines (logistic regression, L1, LDA,
    Naive Bayes, KNN, and SMOTE/ADASYN/undersampling via `imblearn.pipeline`)
    with `utils.evaluador_cv.EvaluadorCV`, grouped by `SEGMENTO`.
+   - **`test.pkl` stays unopened until the project's final evaluation.**
+     Model selection uses train (CV) and val only.
+   - Column roles: `LLAVES = [DIRECTORIO, SECUENCIA_P]` (traceability only),
+     `GRUPO = SEGMENTO`, `PESO` (only for weighted fits), `OBJETIVO = POBRE`.
+     Every other column is a feature (`CARACTERISTICAS`).
+   - The first cell calls `sklearn.set_config(enable_metadata_routing=True)`
+     globally, so `groups` reach `SequentialFeatureSelector`'s inner CV.
+   - It still defines its own copies of the threshold scorers and
+     pseudo-R² functions. `EvaluadorCV` doesn't use them: edit the module's
+     versions.
 4. `notebooks/consolidate_dfs.ipynb` and `full_analisis.ipynb` are earlier
    explorations that worked out the join keys. They are reference material,
    not part of the pipeline.
@@ -35,7 +45,9 @@ Pipeline, in order:
 `config.py` defines `config.WORKDIR`, `config.DATADIR` (`data/`) and
 `config.EXTRACTED` (`data/extracted/`). `Dockerfile`, `.dockerignore` and
 `.env` are empty placeholders. Generated figures and tables go in
-`outputs/plots/` and `outputs/tables/`.
+`outputs/plots/` and `outputs/tables/`. `docs/MACHINE_LEARNING_ENTREGA_2.pdf`
+is the submitted second-draft course report, and `references.bib` holds its
+bibliography.
 
 ## Environment and commands
 
@@ -91,7 +103,9 @@ pep8-naming.
 `data/ECV_2025/` is downloaded by hand from the Google Drive folder linked in
 `README.md`. It holds one zip per survey module, each with the same table as
 `.csv`, `.DTA` and `.sav` (none of them carry value labels). Besides the raw
-data, `data/` holds the generated `splits/` and `cache_cv/`. Notebooks don't read the
+data, `data/` holds the generated `splits/`, `cache_cv/` (`EvaluadorCV`
+results) and `cache_pipe/` (the `Pipeline(memory=...)` transformer cache
+that `modeling.ipynb` uses). Deleting either cache forces a retrain. Notebooks don't read the
 zips: `unzip_year.py` flattens them into
 `data/extracted/ECV_2025_extracted/<ext>/` (fixing cp437-mangled accented
 names), and notebooks read `config.EXTRACTED / "ECV_2025_extracted" / "csv"`.
@@ -194,11 +208,30 @@ through it.
 - `grupos` (`SEGMENTO`) reaches the inner CV of steps such as
   `SequentialFeatureSelector` through sklearn metadata routing, which is
   switched on only inside a `config_context`.
-- With `pickle=True`, results are cached in `data/cache_cv/` under a
-  `joblib.hash` of the cloned pipeline, the data, the groups, the threshold,
-  the CV, the sklearn version **and the source of `evaluador_cv.py`**. Any
-  edit to that module silently invalidates every cache, so the next notebook
-  run retrains everything.
+- **Nested CV with `grid=`**: passing a `param_grid` (a dict or a list of
+  dicts, keys like `"model__C"`, `"select_vars__n_features_to_select"`)
+  wraps the pipeline in `GridSearchCV`, scored by `target_score`
+  (default `"average_precision"`). Each outer fold tunes only on its own
+  training rows, with an inner `StratifiedGroupKFold(5)` seeded
+  `random_state + 1`. `mejores_parametros()` shows each fold's
+  `best_params_`. With `estabilidad=True` it also reports how consistently
+  the folds chose them. `coeficientes` and `frecuencia_variables` unwrap
+  each fold's `best_estimator_` via `_ajustado()`. The other methods only
+  call `predict_proba`, which `GridSearchCV` passes through to that
+  estimator.
+  `ajustar_final()` returns the fitted `GridSearchCV`, not a bare pipeline.
+  A nested grid over a backward `SequentialFeatureSelector` is very slow.
+- Caching is **on by default** (`cache=True`; the old `pickle=` keyword
+  still works and overrides it). `evaluar_cv()` wraps the module-level
+  `_validar_cruzado` with `utils.cache.cached`, writing
+  `data/cache_cv/cv_<key>.pkl` with joblib. The key is a content hash
+  (`utils.cache.content_hash`) of the cloned pipeline (or its
+  `GridSearchCV`), the data and groups **by value**, the threshold, the CV,
+  the sklearn version, and the source of `_validar_cruzado` and the scorers.
+  Only edits to those two invalidate the cache; `evaluar_cv(recalcular=True)`
+  forces a retrain. Don't go back to `joblib.hash` on DataFrames: it depends
+  on the memory layout, so `X` and `X.copy()` hash differently and the cache
+  never hits.
 
 ## `utils/` analysis toolkit
 
@@ -206,7 +239,7 @@ through it.
 statistical test is chosen). Update it when you change a module. Its
 "Installed / imports cleanly" section is stale. Architectural rules:
 
-- One self-contained module per analysis idea. Modules **never import each other** and `__init__.py` re-exports nothing. A helper needed by two modules is copied, not shared.
+- One self-contained module per analysis idea. Modules **never import each other**, with one exception: `evaluador_cv` imports `cached` from `utils/cache.py` (a disk cache for slow functions). `__init__.py` re-exports nothing. Otherwise, a helper needed by two modules is copied, not shared.
 - Notebooks import `utils`, `domain` and `config` by putting the repo root on the path: `sys.path.insert(0, str(Path.cwd().parent))`, then `from utils.fancy_barplot import fancy_bars`.
 - Plotting contract (used by `fancy_barplot`, `fancy_hist`, `segmented_bars`; follow it in new modules): accept `ax=None`, return the Axes, don't call `plt.show()`, and `title=None` builds the title from the column name. `bivaraite_boxplot` and `category_vs_numeric_plot` predate this contract: they call `plt.show()` and can't go into subplot grids.
 - Identifiers are in English. Figure text and `ValueError` messages are in Spanish.

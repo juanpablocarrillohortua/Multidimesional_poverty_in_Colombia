@@ -21,14 +21,16 @@ scikit-learn, que se activa solo durante cada llamada y no cambia la
 configuración global.
 """
 
+import inspect
 from collections import Counter
 from pathlib import Path
 
-import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sklearn
+from matplotlib.colors import to_rgba
+from matplotlib.patches import Rectangle
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -44,10 +46,44 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
-from sklearn.model_selection import StratifiedGroupKFold, cross_validate
+from sklearn.model_selection import (
+    GridSearchCV,
+    StratifiedGroupKFold,
+    cross_validate,
+)
+
+from utils.cache import cached
 
 # data/ está en .gitignore, así que la caché nunca se versiona
 DIR_CACHE = Path(__file__).resolve().parent.parent / "data" / "cache_cv"
+
+# Estilo de los gráficos de estabilidad de hiperparámetros
+INK, TXT = "#0b0b0b", "#52514e"
+# Un color por conjunto de hiperparámetros, en orden fijo de frecuencia
+PALETA_CONJUNTOS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
+# Valores de un hiperparámetro: el más elegido oscuro, los demás más claros
+RAMPA_VALORES = ["#2a78d6", "#6da7ec", "#9ec5f4", "#cde2fb", "#e6f0fc"]
+# Nombres de hiperparámetros que no caben en el eje
+ABREVIATURAS = {
+    "n_features_to_select": "n_features",
+    "sampling_strategy": "sampling",
+}
+
+
+def _etiqueta_param(nombre):
+    """'select_vars__n_features_to_select' -> 'select_vars\\nn_features'."""
+    paso, _, resto = nombre.partition("__")
+    if not resto:
+        return nombre
+    resto = resto.replace("estimator__", "estimator ")
+    return f"{paso}\n{ABREVIATURAS.get(resto, resto)}"
+
+
+def _texto_valor(valor):
+    """Texto corto de un hiperparámetro: NaN es 'no aplica'."""
+    if isinstance(valor, (float, np.floating)):
+        return "no aplica" if np.isnan(valor) else f"{valor:.3g}"
+    return str(valor)
 
 
 def _custom_accuracy(y_true, y_proba, threshold):
@@ -82,6 +118,53 @@ def _crear_scoring(umbral):
         # No depende del umbral: AP evalúa todos los umbrales
         "average_precision": "average_precision",
     }
+
+
+def _fuente_scorers():
+    """Código de los scorers: entra en la clave de la caché para que
+    cambiarlos invalide los resultados guardados."""
+    return "".join(
+        inspect.getsource(f)
+        for f in (
+            _custom_accuracy,
+            _custom_precision,
+            _custom_recall,
+            _custom_kappa,
+            _crear_scoring,
+        )
+    )
+
+
+def _validar_cruzado(
+    estimador, X, y, grupos, umbral, cv, version_sklearn, fuente_scorers
+):
+    """Validación cruzada y probabilidades fuera de muestra por pliegue.
+
+    Es la parte lenta de EvaluadorCV.evaluar_cv() y la que se guarda en
+    caché. version_sklearn y fuente_scorers no se usan aquí: solo entran
+    en la clave de la caché.
+    """
+    with sklearn.config_context(enable_metadata_routing=True):
+        scores = cross_validate(
+            estimator=estimador,
+            X=X,
+            y=y,
+            params={"groups": grupos},
+            cv=cv,
+            scoring=_crear_scoring(umbral),
+            return_estimator=True,
+            return_indices=True,
+        )
+
+    # Probabilidades de cada pliegue con los modelos que ya ajustó
+    # cross_validate: no se reentrena nada
+    probas_cv = [
+        (y.iloc[idx_te], modelo.predict_proba(X.iloc[idx_te])[:, 1])
+        for modelo, idx_te in zip(
+            scores["estimator"], scores["indices"]["test"]
+        )
+    ]
+    return {"scores": scores, "probas_cv": probas_cv}
 
 
 def _cox_snell_r2(model, X, y):
@@ -128,15 +211,28 @@ class EvaluadorCV:
     grupos       : Series con el grupo de cada fila (por ejemplo, SEGMENTO)
     cv           : separador de pliegues. Por defecto
                    StratifiedGroupKFold(5, shuffle=True, random_state)
+    grid         : param_grid para GridSearchCV (por ejemplo
+                   {"model__C": [0.1, 1, 10]}). Si se da, cada pliegue
+                   busca los hiperparámetros solo con sus filas de
+                   entrenamiento (validación cruzada anidada), con un
+                   StratifiedGroupKFold(5) interno de semilla
+                   random_state + 1. Por defecto None: sin búsqueda
+    target_score : métrica con la que GridSearchCV elige los
+                   hiperparámetros (default "average_precision")
+    n_jobs       : procesos de GridSearchCV (default -1, todos)
     random_state : semilla del separador por defecto (default 42)
-    pickle       : si es True, evaluar_cv() guarda sus resultados en un
-                   .pkl y, en las siguientes ejecuciones, los carga en vez
-                   de reentrenar mientras no cambie nada de lo que los
-                   determina (Pipeline, datos, grupos, umbral, pliegues,
-                   versión de scikit-learn o el código de este módulo)
-    dir_cache    : carpeta de los .pkl. Por defecto data/cache_cv/ en la
-                   raíz del repositorio. Cargue solo archivos propios: un
-                   pickle puede ejecutar código al abrirse.
+    cache        : si es True (default), evaluar_cv() guarda sus
+                   resultados con joblib (utils/cache.py) y, en las
+                   siguientes ejecuciones, los carga en vez de reentrenar
+                   mientras no cambie nada de lo que los determina:
+                   Pipeline (y grid), datos, grupos, umbral, pliegues,
+                   versión de scikit-learn, el código de la validación
+                   cruzada o el de los scorers. Los datos se comparan por
+                   contenido, no por cómo están guardados en memoria.
+    pickle       : alias antiguo de cache. Si se da, manda sobre cache
+    dir_cache    : carpeta de los archivos. Por defecto data/cache_cv/ en
+                   la raíz del repositorio. Cargue solo archivos propios:
+                   un archivo de joblib puede ejecutar código al abrirse.
     """
 
     def __init__(
@@ -147,8 +243,12 @@ class EvaluadorCV:
         umbral,
         grupos,
         cv=None,
+        grid=None,
+        target_score="average_precision",
+        n_jobs=-1,
         random_state=42,
-        pickle=False,
+        cache=True,
+        pickle=None,
         dir_cache=None,
     ):
         self.pipeline = pipeline
@@ -160,88 +260,392 @@ class EvaluadorCV:
             cv = StratifiedGroupKFold(
                 n_splits=5, shuffle=True, random_state=random_state
             )
+        # Pliegues internos de GridSearchCV, distintos de los externos
+        self.cv_grid = StratifiedGroupKFold(
+            n_splits=5, shuffle=True, random_state=random_state + 1
+        )
         self.cv = cv
         self.random_state = random_state
-        self.pickle = pickle
+        self.cache = cache if pickle is None else pickle
         self.dir_cache = Path(dir_cache) if dir_cache else DIR_CACHE
         self.scores = None
         self.probas_cv = None
         self.k_intersect = None
         self.train_test = None
         self.bootstrap = None
+        self.grid = grid
+        self.target_score = target_score
+        self.n_jobs = n_jobs
 
     def _requiere_cv(self):
         if self.scores is None:
             raise ValueError("Primero ejecute evaluar_cv().")
 
-    def _clave_cache(self):
-        """Hash de todo lo que determina el resultado de evaluar_cv().
+    def _estimador(self):
+        """Pipeline a validar; envuelto en GridSearchCV si hay grid.
 
-        clone() deja solo los hiperparámetros, así que un Pipeline ya
-        ajustado da la misma clave. El código del módulo entra en la clave
-        para que cambiar los scorers invalide las cachés anteriores.
+        No modifica self.pipeline, así que se puede llamar varias veces.
         """
-        return joblib.hash(
-            (
-                clone(self.pipeline),
-                self.X_train,
-                self.y_train,
-                self.grupos,
-                self.umbral,
-                self.cv,
-                sklearn.__version__,
-                Path(__file__).read_bytes(),
-            )
+        if self.grid is None:
+            return self.pipeline
+        return GridSearchCV(
+            estimator=self.pipeline,
+            param_grid=self.grid,
+            cv=self.cv_grid,
+            scoring=self.target_score,
+            n_jobs=self.n_jobs,
         )
 
-    def evaluar_cv(self):
+    @staticmethod
+    def _ajustado(estimador):
+        """Pipeline de un pliegue: el mejor de la búsqueda si hubo grid."""
+        return getattr(estimador, "best_estimator_", estimador)
+
+    def variables_seleccionadas(self, estimador):
+        """Nombres de las variables que eligió el paso 'select_vars' de un
+        Pipeline ajustado (por ejemplo, uno de self.scores["estimator"]).
+
+        Pasa los nombres de X_train por todos los pasos anteriores al
+        selector (imputer y, si los hay, filtros o escaladores), así que la
+        máscara del selector siempre se aplica a las columnas que recibió.
+        Los pasos sin get_feature_names_out (los rebalanceos) no cambian
+        las columnas y se saltan.
+        """
+        pipeline = self._ajustado(estimador)
+        pasos = list(pipeline.named_steps)
+        nombres = np.asarray(self.X_train.columns, dtype=object)
+        for nombre in pasos[: pasos.index("select_vars")]:
+            paso = pipeline.named_steps[nombre]
+            if hasattr(paso, "get_feature_names_out"):
+                nombres = paso.get_feature_names_out(nombres)
+        mascara = pipeline.named_steps["select_vars"].get_support()
+        return np.asarray(nombres)[mascara]
+
+    def mejores_parametros(self, estabilidad=False):
+        """Hiperparámetros que GridSearchCV eligió en cada pliegue.
+
+        Con estabilidad=False (default) devuelve un DataFrame con una fila
+        por pliegue externo y una columna por hiperparámetro.
+
+        Con estabilidad=True imprime un resumen y devuelve un dict con:
+
+        por_pliegue : la misma tabla de una fila por pliegue
+        conjuntos   : cada combinación completa distinta, con cuántos
+                      pliegues la eligieron (Pliegues, Porcentaje) y cuáles
+                      (Folds). La estabilidad del conjunto es el Porcentaje
+                      de la primera fila: 100 % si todos los pliegues
+                      eligieron la misma combinación
+        valores     : cada valor de cada hiperparámetro, con cuántos
+                      pliegues lo eligieron (Pliegues, Porcentaje)
+        parametros  : por hiperparámetro, el valor más elegido
+                      (Valor_modal), en cuántos pliegues (Pliegues_modal),
+                      su porcentaje (Estabilidad) y cuántos valores
+                      distintos salieron (Valores_distintos)
+
+        En las tres tablas de estabilidad, los valores que no son números
+        ni texto (None o, por ejemplo, un escalador dentro del grid) se
+        comparan por su repr. Si un hiperparámetro no aplica en un pliegue
+        (grid como lista de dicts), queda como NaN y cuenta como un valor
+        más ("no aplica" en el resumen).
+        """
+        if not estabilidad:
+            return self._por_pliegue()
+
+        tablas = self._estabilidad()
+        conjuntos = tablas["conjuntos"]
+        parametros = tablas["parametros"]
+        params = list(parametros.index)
+        n_folds = len(tablas["por_pliegue"])
+
+        def texto(valor):
+            return "no aplica" if pd.isna(valor) else str(valor)
+
+        primero = conjuntos.iloc[0]
+        combinacion = ", ".join(f"{p}={texto(primero[p])}" for p in params)
+        print(
+            f"Conjunto más elegido: {combinacion} en "
+            f"{int(primero['Pliegues'])}/{n_folds} pliegues "
+            f"({primero['Porcentaje']:.0f} %); "
+            f"{len(conjuntos)} combinaciones distintas."
+        )
+        for param in params:
+            print(
+                f"  {param}: {texto(parametros.at[param, 'Valor_modal'])} "
+                f"en {int(parametros.at[param, 'Pliegues_modal'])}/{n_folds}"
+                f" pliegues ({parametros.at[param, 'Estabilidad']:.0f} %), "
+                f"{int(parametros.at[param, 'Valores_distintos'])} valores "
+                "distintos"
+            )
+        return {
+            k: tablas[k]
+            for k in ("por_pliegue", "conjuntos", "valores", "parametros")
+        }
+
+    def _por_pliegue(self):
+        """best_params_ de cada pliegue externo, una fila por pliegue."""
+        self._requiere_cv()
+        if self.grid is None:
+            raise ValueError(
+                "No hubo búsqueda de hiperparámetros: pase grid al crear "
+                "el EvaluadorCV."
+            )
+        return pd.DataFrame(
+            [estimador.best_params_ for estimador in self.scores["estimator"]]
+        ).rename_axis("fold")
+
+    def _estabilidad(self):
+        """Tablas de estabilidad de mejores_parametros(estabilidad=True),
+        sin imprimir nada. Las usan también los gráficos de estabilidad."""
+        por_pliegue = self._por_pliegue()
+
+        def etiqueta(valor):
+            # None queda como texto para no confundirlo con un
+            # hiperparámetro que no aplica (NaN); los objetos
+            # (estimadores) no se comparan bien entre clones
+            if isinstance(valor, (bool, int, float, str)):
+                return valor
+            return repr(valor)
+
+        params = list(por_pliegue.columns)
+        # dtype object: los enteros no pasan a float por un NaN
+        etiquetas = pd.DataFrame(
+            [
+                {k: etiqueta(v) for k, v in estimador.best_params_.items()}
+                for estimador in self.scores["estimator"]
+            ],
+            columns=params,
+            dtype=object,
+        ).rename_axis("fold")
+        n_folds = len(etiquetas)
+
+        # Combinación completa elegida en cada pliegue
+        conjuntos = (
+            etiquetas.reset_index()
+            .groupby(params, dropna=False, sort=False)["fold"]
+            .agg(Pliegues="count", Folds=list)
+            .reset_index()
+            .sort_values("Pliegues", ascending=False, kind="stable")
+            .reset_index(drop=True)
+        )
+        conjuntos["Porcentaje"] = conjuntos["Pliegues"] / n_folds * 100
+
+        # Cada valor de cada hiperparámetro por separado
+        valores = (
+            etiquetas.melt(var_name="Parametro", value_name="Valor")
+            .groupby(["Parametro", "Valor"], dropna=False, sort=False)
+            .size()
+            .rename("Pliegues")
+            .reset_index()
+            .sort_values(
+                ["Parametro", "Pliegues"],
+                ascending=[True, False],
+                kind="stable",
+            )
+            .reset_index(drop=True)
+        )
+        valores["Porcentaje"] = valores["Pliegues"] / n_folds * 100
+
+        # Valor modal de cada hiperparámetro (en empate, el primero que
+        # apareció)
+        modal = (
+            valores.groupby("Parametro", sort=False)
+            .head(1)
+            .set_index("Parametro")
+        )
+        parametros = pd.DataFrame(
+            {
+                "Valor_modal": modal["Valor"],
+                "Pliegues_modal": modal["Pliegues"],
+                "Estabilidad": modal["Porcentaje"],
+                "Valores_distintos": valores.groupby("Parametro").size(),
+            }
+        ).reindex(params)
+        parametros.index.name = "Parametro"
+
+        return {
+            "por_pliegue": por_pliegue,
+            "conjuntos": conjuntos,
+            "valores": valores,
+            "parametros": parametros,
+            # Solo para los gráficos: None queda como "None", no como NaN
+            "etiquetas": etiquetas,
+        }
+
+    def grafico_conjuntos(self, ax=None):
+        """Mosaico pliegue × hiperparámetro con el valor que eligió
+        GridSearchCV en cada pliegue externo.
+
+        El color de cada fila es el conjunto completo que eligió ese
+        pliegue: el conjunto 1 (azul) es el más elegido y los demás siguen
+        por frecuencia. Filas del mismo color eligieron la misma
+        combinación; dentro de una columna se ve qué hiperparámetro las
+        separa. Solo aplica con grid. Devuelve el Axes.
+        """
+        tablas = self._estabilidad()
+        # Las etiquetas y no best_params_ crudos: en un DataFrame un None
+        # pasa a NaN y se confundiría con "no aplica"
+        por_pliegue = tablas["etiquetas"]
+        conjuntos = tablas["conjuntos"]
+        params = list(por_pliegue.columns)
+        n_folds, n_params = por_pliegue.shape
+        # Número de conjunto (0 = el más elegido) de cada pliegue
+        conjunto_de = {
+            fold: n
+            for n, folds in enumerate(conjuntos["Folds"])
+            for fold in folds
+        }
+
+        if ax is None:
+            _, ax = plt.subplots(
+                figsize=(1.5 * n_params + 2.5, 0.55 * n_folds + 2)
+            )
+        for fila, fold in enumerate(por_pliegue.index):
+            color = PALETA_CONJUNTOS[conjunto_de[fold] % len(PALETA_CONJUNTOS)]
+            for col, param in enumerate(params):
+                ax.add_patch(
+                    Rectangle(
+                        (col - 0.5, fila - 0.5),
+                        1,
+                        1,
+                        facecolor=to_rgba(color, 0.35),
+                        edgecolor="white",
+                        linewidth=2,
+                    )
+                )
+                ax.text(
+                    col,
+                    fila,
+                    _texto_valor(por_pliegue.at[fold, param]),
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color=INK,
+                )
+
+        ax.set_xlim(-0.5, n_params - 0.5)
+        ax.set_ylim(n_folds - 0.5, -0.5)
+        ax.set_xticks(
+            range(n_params),
+            labels=[_etiqueta_param(p) for p in params],
+            fontsize=8,
+        )
+        # El conjunto también va en texto: el color no es la única pista
+        ax.set_yticks(
+            range(n_folds),
+            labels=[
+                f"Fold {fold + 1} · conj. {conjunto_de[fold] + 1}"
+                for fold in por_pliegue.index
+            ],
+            fontsize=8,
+        )
+        ax.tick_params(length=0)
+        for borde in ax.spines.values():
+            borde.set_visible(False)
+
+        primero = conjuntos.iloc[0]
+        ax.set_title(
+            f"Conjunto modal en {int(primero['Pliegues'])}/{n_folds} "
+            f"pliegues ({primero['Porcentaje']:.0f} %) · "
+            f"{len(conjuntos)} combinaciones"
+        )
+        return ax
+
+    def grafico_parametros(self, ax=None):
+        """Barra 100 % por hiperparámetro: cada segmento es un valor y su
+        ancho, el % de pliegues externos que lo eligieron.
+
+        El valor más elegido va primero, en azul; los demás siguen en
+        tonos más claros. La estabilidad (ancho del primer segmento) se
+        anota a la derecha. Solo aplica con grid. Devuelve el Axes.
+        """
+        tablas = self._estabilidad()
+        valores = tablas["valores"]
+        parametros = tablas["parametros"]
+        params = list(parametros.index)
+
+        if ax is None:
+            _, ax = plt.subplots(figsize=(9, 0.7 * len(params) + 1.5))
+        for fila, param in enumerate(params):
+            # valores ya viene ordenado: el modal primero
+            datos = valores[valores["Parametro"] == param]
+            izquierda = 0.0
+            for rango, (valor, porcentaje) in enumerate(
+                zip(datos["Valor"], datos["Porcentaje"])
+            ):
+                ax.barh(
+                    fila,
+                    porcentaje,
+                    left=izquierda,
+                    height=0.6,
+                    color=RAMPA_VALORES[min(rango, len(RAMPA_VALORES) - 1)],
+                    edgecolor="white",
+                    linewidth=2,
+                )
+                # Segmentos angostos sin texto para que no se monte
+                if porcentaje >= 20:
+                    ax.text(
+                        izquierda + porcentaje / 2,
+                        fila,
+                        _texto_valor(valor),
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                        color="white" if rango == 0 else INK,
+                    )
+                izquierda += porcentaje
+            ax.text(
+                101.5,
+                fila,
+                f"{parametros.at[param, 'Estabilidad']:.0f} %",
+                va="center",
+                fontsize=8,
+                color=TXT,
+            )
+
+        ax.set_xlim(0, 100)
+        ax.set_ylim(len(params) - 0.5, -0.5)
+        ax.set_yticks(
+            range(len(params)),
+            labels=[_etiqueta_param(p) for p in params],
+            fontsize=8,
+        )
+        ax.set_xlabel("% de pliegues")
+        ax.set_title("Estabilidad por hiperparámetro")
+        ax.tick_params(axis="y", length=0)
+        for lado in ("top", "right", "left"):
+            ax.spines[lado].set_visible(False)
+        return ax
+
+    def evaluar_cv(self, recalcular=False):
         """Corre la validación cruzada y guarda las probabilidades por
         pliegue. Devuelve self para poder encadenar llamadas.
 
-        Con pickle=True carga los resultados de la caché si ya existen
-        para estos mismos parámetros, sin reentrenar.
+        Con la caché activa (por defecto) carga los resultados si ya
+        existen para estos mismos parámetros, sin reentrenar. Con
+        recalcular=True reentrena y sobrescribe el archivo guardado.
         """
         print(f"umbral: {self.umbral}")
-        archivo = None
-        if self.pickle:
-            archivo = self.dir_cache / f"{self._clave_cache()}.pkl"
-            if archivo.exists():
-                cache = joblib.load(archivo)
-                self.scores = cache["scores"]
-                self.probas_cv = cache["probas_cv"]
-                print(f"Resultados cargados de caché: {archivo}")
-                return self
+        validar = _validar_cruzado
+        opciones = {}
+        if self.cache:
+            validar = cached(cache_dir=self.dir_cache, label="cv")(validar)
+            opciones = {"force_rerun": recalcular}
 
-        with sklearn.config_context(enable_metadata_routing=True):
-            self.scores = cross_validate(
-                estimator=self.pipeline,
-                X=self.X_train,
-                y=self.y_train,
-                params={"groups": self.grupos},
-                cv=self.cv,
-                scoring=_crear_scoring(self.umbral),
-                return_estimator=True,
-                return_indices=True,
-            )
-
-        # Probabilidades de cada pliegue con los modelos que ya ajustó
-        # cross_validate: no se reentrena nada
-        self.probas_cv = [
-            (
-                self.y_train.iloc[idx_te],
-                estimador.predict_proba(self.X_train.iloc[idx_te])[:, 1],
-            )
-            for estimador, idx_te in zip(
-                self.scores["estimator"], self.scores["indices"]["test"]
-            )
-        ]
-
-        if archivo is not None:
-            archivo.parent.mkdir(parents=True, exist_ok=True)
-            joblib.dump(
-                {"scores": self.scores, "probas_cv": self.probas_cv}, archivo
-            )
-            print(f"Resultados guardados en caché: {archivo}")
+        # clone() deja solo los hiperparámetros, así que un Pipeline ya
+        # ajustado da la misma clave de caché
+        resultado = validar(
+            clone(self._estimador()),
+            self.X_train,
+            self.y_train,
+            self.grupos,
+            self.umbral,
+            self.cv,
+            sklearn.__version__,
+            _fuente_scorers(),
+            **opciones,
+        )
+        self.scores = resultado["scores"]
+        self.probas_cv = resultado["probas_cv"]
         return self
 
     def resumen_metricas(self):
@@ -267,18 +671,9 @@ class EvaluadorCV:
 
         feature_counts = Counter()
 
-        for estimator in self.scores["estimator"]:
-            # Nombres de variables después del imputer
-            feat_names = estimator.named_steps[
-                "imputer"
-            ].get_feature_names_out(self.X_train.columns)
-
-            # Máscara de las variables seleccionadas en este fold
-            mask = estimator.named_steps["select_vars"].get_support()
-
-            # Acumular las variables seleccionadas
-            selected_in_fold = feat_names[mask]
-            feature_counts.update(selected_in_fold)
+        for estimador in self.scores["estimator"]:
+            # Variables seleccionadas en este fold
+            feature_counts.update(self.variables_seleccionadas(estimador))
 
         # 2. Convertir a DataFrame para presentar los resultados organizados
         n_folds = len(self.scores["estimator"])
@@ -326,7 +721,8 @@ class EvaluadorCV:
                 "El Pipeline necesita pasos llamados 'imputer', "
                 "'select_vars' y 'model' para resumir los coeficientes."
             )
-        if not hasattr(self.scores["estimator"][0]["model"], "coef_"):
+        primero = self._ajustado(self.scores["estimator"][0])
+        if not hasattr(primero["model"], "coef_"):
             raise ValueError(
                 "El modelo no tiene coeficientes (coef_): solo aplica a "
                 "modelos lineales."
@@ -335,21 +731,12 @@ class EvaluadorCV:
         registros = []
         n_folds = len(self.scores["estimator"])
 
-        for idx, pipeline in enumerate(self.scores["estimator"]):
-            imputer = pipeline.named_steps["imputer"]
-            selector = pipeline.named_steps["select_vars"]
-            modelo = pipeline.named_steps["model"]
+        for idx, estimador in enumerate(self.scores["estimator"]):
+            modelo = self._ajustado(estimador).named_steps["model"]
 
-            # 1. Recuperar los nombres de las columnas que genera el
-            # SimpleImputer (incluye las variables originales y las
-            # columnas indicadoras si hubo nulos)
-            nombres_imputed = imputer.get_feature_names_out(
-                self.X_train.columns
-            )
-
-            # 2. Filtrar las columnas seleccionadas por el
-            # SequentialFeatureSelector
-            nombres_seleccionados = nombres_imputed[selector.get_support()]
+            # 1-2. Variables que eligió el selector (los nombres pasan por
+            # el imputer y por los pasos que haya antes del selector)
+            nombres_seleccionados = self.variables_seleccionadas(estimador)
 
             # 3. Guardar variables y coeficientes de este fold
             for var, coef in zip(nombres_seleccionados, modelo.coef_[0]):
@@ -460,14 +847,14 @@ class EvaluadorCV:
         evaluación, no la del entrenamiento.
 
         Es decir crea un vector de predicciones global y hace el bootstrap
-        sobre esos vectores, luego en cada iteracion saca valores de ese
-        vector tomando en cuenta los grupos y en base a los vecotres extraidos
-        se calculan metricas, de ese proceso nacen las distribucuiobes
-        empircas que dan pie a los IC.
+        sobre esos vectores, luego en cada iteración saca valores de ese
+        vector tomando en cuenta los grupos y en base a los vectores
+        extraídos se calculan métricas, de ese proceso nacen las
+        distribuciones empíricas que dan pie a los IC.
 
         Este enfoque se toma en lugar de reentrenar una y otra vez pues con
-        las Pipelines desarrolladas esto seria muy lento y se conservan las
-        ventajas de aumentar la confianza en las esimtaciones al eliminar
+        las Pipelines desarrolladas esto sería muy lento y se conservan las
+        ventajas de aumentar la confianza en las estimaciones al eliminar
         ruido de tomar solo un corte.
         """
         self._requiere_cv()
@@ -792,8 +1179,13 @@ class EvaluadorCV:
         return disp.ax_
 
     def ajustar_final(self):
-        """Ajusta una copia del Pipeline sobre todo train y la devuelve."""
-        modelo = clone(self.pipeline)
+        """Ajusta una copia del Pipeline sobre todo train y la devuelve.
+
+        Con grid devuelve el GridSearchCV ajustado: busca los
+        hiperparámetros en todo train y el Pipeline ganador queda en
+        best_estimator_.
+        """
+        modelo = clone(self._estimador())
         with sklearn.config_context(enable_metadata_routing=True):
             try:
                 modelo.fit(self.X_train, self.y_train, groups=self.grupos)

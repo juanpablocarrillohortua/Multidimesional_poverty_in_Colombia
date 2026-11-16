@@ -12,6 +12,8 @@ class Configuration(object):
 
         self.DATADIR = self.WORKDIR / "data"
 
+        self.MODEL_DIR = self.WORKDIR / "models"
+
         self.EXTRACTED = self.DATADIR / "extracted"
 
 config = Configuration()

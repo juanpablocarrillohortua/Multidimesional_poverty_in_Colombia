@@ -1,9 +1,10 @@
 # `utils/` — analysis toolkit
 
 One self-contained module per analysis idea. The modules **never import each
-other** and [`__init__.py`](__init__.py) re-exports nothing, so always import
-the submodule directly. If two modules need the same helper, it is copied
-rather than shared.
+other**, with one exception: `evaluador_cv` imports `cached` from
+[`cache`](cache.py). [`__init__.py`](__init__.py) re-exports nothing, so
+always import the submodule directly. Otherwise, if two modules need the same
+helper, it is copied rather than shared.
 
 ## Quick start
 
@@ -41,6 +42,7 @@ test_features_against_target(df, ["Age_at_StudyDate", "race"], "label")
 | [`vif_resume`](vif_resume.py) | Which predictors are redundant with each other? | `vif_table` | `DataFrame` |
 | [`fast_OLS`](fast_OLS.py) | Full diagnostics of a fitted OLS model | class `DiagnosticoOLS` | varies |
 | [`evaluador_cv`](evaluador_cv.py) | How does a classification Pipeline perform under grouped, stratified CV? | class `EvaluadorCV` | varies |
+| [`cache`](cache.py) | How do I avoid re-running a slow function with the same inputs? | decorator `cached`, `content_hash` | the function's result |
 
 > **Two modules do not import today.** `fast_OLS` needs `plotly` and
 > `mutual_inf_plot` needs `scikit-learn`; neither is installed. See
@@ -480,14 +482,19 @@ can be compared, plus the final fit on all of train.
 | `umbral` | `float` | — | decision threshold for accuracy, precision, recall, kappa and the confusion matrix |
 | `grupos` | `Series` | — | group of each row (e.g. `SEGMENTO`); no row's group is split across folds |
 | `cv` | splitter | `None` | defaults to `StratifiedGroupKFold(5, shuffle=True, random_state)` |
-| `random_state` | `int` | `42` | seed of the default splitter and default seed of `bootstrap_ic` |
-| `pickle` | `bool` | `False` | cache `evaluar_cv()` results in a `.pkl` and reload them instead of retraining while nothing changed (see below) |
+| `grid` | `dict \| None` | `None` | `param_grid` for a `GridSearchCV` nested in each outer fold (e.g. `{"model__C": [0.1, 1, 10]}`): hyperparameters are tuned only on that fold's training rows, with an inner `StratifiedGroupKFold(5)` seeded `random_state + 1`. `None` means no search |
+| `target_score` | `str` | `"average_precision"` | scorer `GridSearchCV` uses to pick the hyperparameters |
+| `n_jobs` | `int` | `-1` | processes for `GridSearchCV` |
+| `random_state` | `int` | `42` | seed of the default splitter, of the inner grid splitter (`+ 1`) and default seed of `bootstrap_ic` |
+| `cache` | `bool` | `True` | store `evaluar_cv()` results with joblib (`utils/cache.py`) and reload them instead of retraining while nothing changed (see below) |
+| `pickle` | `bool \| None` | `None` | old name of `cache`, kept so existing notebooks work; when given, it overrides `cache` |
 | `dir_cache` | `str \| Path \| None` | `None` | cache folder; defaults to `data/cache_cv/` at the repo root (gitignored) |
 
 | Method | Returns | What it does |
 | --- | --- | --- |
-| `evaluar_cv()` | `self` | `cross_validate` with the scorers and keeps each fold's fitted model, test indices and probabilities (`scores`, `probas_cv`). Run it first |
+| `evaluar_cv(recalcular=False)` | `self` | `cross_validate` with the scorers and keeps each fold's fitted model, test indices and probabilities (`scores`, `probas_cv`). Run it first. Loads the result from the cache when it exists; `recalcular=True` retrains and overwrites it |
 | `resumen_metricas()` | nothing | prints mean ± std of every metric across folds |
+| `variables_seleccionadas(estimador)` | `ndarray` | names of the features a fitted fold Pipeline (or its `GridSearchCV`) kept in `select_vars`. The `X_train` names go through every step before the selector (imputer, a `VarianceThreshold`, a scaler…) via `get_feature_names_out`, so the mask always matches the selector's input; steps without it (samplers) are skipped |
 | `frecuencia_variables()` | `DataFrame` | how often each feature was selected; needs steps named `imputer` and `select_vars` |
 | `coeficientes()` | `DataFrame` | per selected feature: mean and std of the model coefficient across folds, times selected and %. Needs `imputer`, `select_vars` and a linear `model` (`coef_`). For a `LogisticRegression` it adds `AOR` (adjusted odds ratio = exp of the mean coefficient, i.e. the geometric mean of the fold odds ratios) and its fold range `AOR_Min` / `AOR_Max` |
 | `pseudo_r2()` | `DataFrame` | Cox & Snell and Nagelkerke R² per fold, computed out of fold (each fold model on its held-out rows, null model = that fold's target rate), plus printed mean ± std. Only for a `LogisticRegression` final step. With `class_weight="balanced"` the values come out low, possibly negative, because the probabilities are shifted |
@@ -496,7 +503,10 @@ can be compared, plus the final fit on all of train.
 | `curva_umbral(k_thresholds=None, ax=None)` | `Axes` | mean precision and recall against the threshold; stores the crossing in `k_intersect` |
 | `comparar_train_test(ax=None)` | `Axes` | grouped bars of every metric's mean ± std across folds, train next to test, to spot overfitting. Train scores come from the fold models `evaluar_cv` already fitted, scored on their own training rows with the same scorers and `umbral` (no refitting). The table (`train_media`, `train_std`, `test_media`, `test_std`, `brecha` = train − test) is stored in `train_test` |
 | `matriz_confusion(ax=None)` | `Axes` | confusion matrix of the out-of-fold predictions at `umbral` |
-| `ajustar_final()` | fitted `Pipeline` | fits a copy of the Pipeline on all of `X_train` |
+| `mejores_parametros(estabilidad=False)` | `DataFrame` or `dict` | hyperparameters `GridSearchCV` chose in each outer fold (`best_params_`); only with `grid`. With `estabilidad=True` it prints a summary and returns a dict of four DataFrames: `por_pliegue` (the per-fold table); `conjuntos` (each distinct full combination with `Pliegues`, `Porcentaje` and `Folds`; the first row's `Porcentaje` is the stability of the whole set); `valores` (each value of each hyperparameter with `Pliegues` and `Porcentaje`); `parametros` (per hyperparameter: `Valor_modal`, `Pliegues_modal`, `Estabilidad` = % of folds with the modal value, `Valores_distintos`). `None` and objects such as scalers are compared by `repr`; a hyperparameter that doesn't apply in a fold (grid as a list of dicts) counts as NaN |
+| `grafico_conjuntos(ax=None)` | `Axes` | tile table, one row per outer fold and one column per hyperparameter, showing the value chosen in each fold; only with `grid`. Each row is tinted with the colour of the full combination its fold chose (combination 1, blue, is the most chosen; the rest follow by frequency), and the row label repeats the combination number (`Fold 1 · conj. 1`). The title gives the modal set's stability and the number of distinct combinations. Built from the same tables as `mejores_parametros(estabilidad=True)`, without printing |
+| `grafico_parametros(ax=None)` | `Axes` | one 100 % horizontal stacked bar per hyperparameter; each segment is a value, as wide as the % of outer folds that chose it. The modal value comes first in blue, the rest in lighter blues, and each segment of at least 20 % is labelled with its value. The modal value's stability is written to the right of each bar; only with `grid` |
+| `ajustar_final()` | fitted `Pipeline` (or `GridSearchCV`) | fits a copy of the Pipeline on all of `X_train`. With `grid` it returns the fitted `GridSearchCV`, searched on all of train; the winning Pipeline is in `best_estimator_` |
 
 Notes:
 - **No refitting after `evaluar_cv`.** The curves and the confusion matrix
@@ -507,19 +517,31 @@ Notes:
   The global sklearn configuration is left as it was.
 - **Pipelines that ignore groups.** If no step uses `groups` (e.g. a
   `DummyClassifier`), `ajustar_final` fits without them.
-- **Cache (`pickle=True`).** The file name is a `joblib.hash` of everything
-  that determines the result:
+- **Hyperparameter search (`grid`).** `self.pipeline` is never replaced:
+  the `GridSearchCV` is built fresh on each call, so `evaluar_cv()` can run
+  again. The fold models in `scores["estimator"]` are `GridSearchCV`
+  objects; `frecuencia_variables()` and `coeficientes()` read each fold's
+  `best_estimator_`. With `grid` and `SequentialFeatureSelector` together the
+  CV is triply nested (outer folds × grid folds × selector folds), so it is
+  much slower; the default cache avoids paying it twice.
+- **Cache (on by default).** `evaluar_cv()` wraps the slow part (the
+  module-level `_validar_cruzado`: `cross_validate` plus the out-of-fold
+  probabilities) with `utils.cache.cached`. The result goes to
+  `dir_cache/cv_<key>.pkl` via `joblib.dump`, and the key is a content hash
+  of:
   - the Pipeline's hyperparameters (via `clone`, so an already fitted
-    Pipeline gives the same key);
-  - `X_train`, `y_train` and `grupos`;
+    Pipeline gives the same key), wrapped in its `GridSearchCV` when there
+    is a `grid` (so `grid`, `target_score` and `n_jobs` count);
+  - `X_train`, `y_train` and `grupos`, **by content** (values, labels and
+    dtypes). A plain `joblib.hash` of a DataFrame depends on its memory
+    layout, so the same data loaded twice could miss the cache;
   - `umbral`, `cv` and the scikit-learn version;
-  - the module's own source.
+  - the source of `_validar_cruzado` and of the scorers.
 
   Changing any of them creates a new file instead of loading a stale one.
-  Any edit to `evaluador_cv.py` therefore invalidates every cache, and
-  every model retrains on its next `evaluar_cv()`. Old files stay on disk
-  and can be deleted by hand. Only load your own
-  cache files: unpickling can run code.
+  Edits elsewhere in `evaluador_cv.py` (plots, docstrings, other methods)
+  keep the cache valid. Old files stay on disk and can be deleted by hand.
+  Only load your own cache files: unpickling can run code.
 - **Self-contained scorers.** The module keeps its own copy of the
   threshold scorers, the same as the notebook's `crear_scoring`.
 
