@@ -16,7 +16,7 @@ PYTHON ?= $(if $(wildcard $(VENV_PYTHON)),$(VENV_PYTHON),python)
 # sidesteps PATH/.exe resolution on Windows.
 RUFF := $(PYTHON) -m ruff
 
-PY_DIRS  := utils
+PY_DIRS  := utils app
 NB_DIRS  := notebooks
 ALL_DIRS := $(PY_DIRS) $(NB_DIRS)
 
@@ -32,7 +32,7 @@ install-dev: ## install linting and formatting tooling
 clean: ## remove byte code, caches and notebook checkpoints
 	@$(PYTHON) tools/clean.py
 
-lint-py: ## check PEP 8 in .py files (scraper, src, utils)
+lint-py: ## check PEP 8 in .py files (utils, app)
 	$(RUFF) check $(PY_DIRS)
 
 lint-nb: ## check PEP 8 in notebooks, cell by cell

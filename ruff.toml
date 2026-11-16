@@ -1,4 +1,4 @@
-# PEP 8 configuration for utils/, data_loader/ and notebooks/.
+# PEP 8 configuration for utils/, app/ and notebooks/.
 # Driven by the Makefile: `make lint`, `make format`, `make quality`.
 
 line-length = 79            # PEP 8 hard limit; raise to 88/100 if too noisy
@@ -45,6 +45,9 @@ unfixable = [
 #       later, so "unused import" is noise here rather than a defect.
 #       Still enforced everywhere else.
 "*.ipynb" = ["E402", "F401"]
+# F401: app/ is a skeleton whose imports (streamlit, pydantic) are
+#       not used yet. Remove this line once the app uses them.
+"app/*" = ["F401"]
 
 [format]
 docstring-code-format = true

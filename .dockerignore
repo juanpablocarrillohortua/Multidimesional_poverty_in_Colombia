@@ -1,0 +1,8 @@
+# Allow-list: the image only needs the app and the production model.
+# Everything else (data/ is ~20 GB, .venv/, notebooks, caches, .env) stays
+# out of the build context.
+*
+!app/
+!models/multidimensional_poverty_model_v1.joblib
+app/__pycache__/
+app/README.md
