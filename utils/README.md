@@ -1,5 +1,7 @@
 # `utils/` — analysis toolkit
 
+**Assisted by Claude Opus 5.5** for support in understanding methodological concepts, organizing ideas, refining academic writing, and assisting with programming tasks. These tools served as supplementary resources and do not replace the authors' own critical analysis or methodological decision-making. The authors remain responsible for verifying the information, validating the procedures and results presented, and ensuring the academic integrity of the work.
+
 One self-contained module per analysis idea. The modules **never import each
 other**, with one exception: `evaluador_cv` imports `cached` from
 [`cache`](cache.py). [`__init__.py`](__init__.py) re-exports nothing, so
