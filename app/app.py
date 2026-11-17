@@ -13,6 +13,14 @@ LABELS = settings.FIELD_LABELS
 # ECV codes the model uses for yes/no questions (1 = yes)
 YES_NO = {1: "Sí", 2: "No"}
 STYLE = Path(__file__).with_name("style.css")
+# Shown next to a "pobre" decision only: it qualifies possible false alarms
+POSITIVE_NOTICE = (
+    "**Aviso:** Al priorizar la detección temprana, el modelo puede marcar "
+    "como vulnerables a hogares con una sola carencia puntual (por ejemplo, "
+    "una familia de 4 integrantes sin otras privaciones donde solo un "
+    "miembro no sepa leer). Interprete este resultado como una alerta "
+    "preventiva (medida de riesgo) y no como una clasificación definitiva."
+)
 
 
 @st.cache_resource
@@ -167,6 +175,7 @@ if predict and household is not None:
             f"Hogar clasificado como **pobre multidimensional** "
             f"(probabilidad {proba:.1%} ≥ umbral {settings.UMBRAL:.0%})."
         )
+        st.warning(POSITIVE_NOTICE, icon=":material/warning:")
     else:
         st.success(
             f"Hogar clasificado como **no pobre multidimensional** "

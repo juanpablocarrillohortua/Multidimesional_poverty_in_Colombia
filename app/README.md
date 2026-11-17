@@ -72,6 +72,8 @@ El modelo fue entrenado con los datos recolectados por el DANE para la encuesta 
 
 ### Opción 1: Descargar desde Docker Hub (Recomendado)
 
+La imagen es multiplataforma (`linux/amd64` y `linux/arm64`), por lo que funciona en Mac (Apple Silicon e Intel), Windows y Linux, Docker descarga automáticamente la versión de su máquina.
+
 ```bash
 docker pull juanpablocarrillo1/multi-dimensional-poverty:latest
 docker run --rm -p 8501:8501 juanpablocarrillo1/multi-dimensional-poverty:latest
